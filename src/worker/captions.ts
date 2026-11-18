@@ -1,4 +1,4 @@
-import { cachedCaptions, cachedVideoId, sampleCaptions, sampleVideoId } from "./sample";
+import { cachedCaptions, cachedVideoId } from "./sample";
 
 const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
 const youtubeHosts = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]);
@@ -113,7 +113,6 @@ export async function getCaptions(videoId: string): Promise<{text: string; title
     return await liveCaptions(videoId);
   } catch (err) {
     if (videoId === cachedVideoId) return cachedCaptions;
-    if (videoId === sampleVideoId) return sampleCaptions;
     // Network and JSON parser exceptions can contain signed URLs or fragments of upstream HTML.
     if (err instanceof Error && /^字幕(源文件过大|过长)/.test(err.message)) throw err;
     throw new Error(unavailable);

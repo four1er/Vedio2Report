@@ -1,5 +1,11 @@
 name: Deploy Worker
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: '验收用 YouTube 视频 ID（默认 W3C，检验实时字幕可换其他公开视频）'
+        type: string
+        default: C4GIqWeywiI
 permissions:
   contents: read
 concurrency:
@@ -31,4 +37,9 @@ jobs:
           secrets_file=$(mktemp)
           trap 'rm -f "$secrets_file"' EXIT
           node -e 'process.stdout.write(JSON.stringify({ GEMINI_API_KEY: process.env.GEMINI_API_KEY }))' > "$secrets_file"
-          npx --no-install wrangler deploy --secrets-file "$secrets_file"
+          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/worker-deployment.jsonl" npx --no-install wrangler deploy --secrets-file "$secrets_file"
+      - name: Verify public page, streamed article and chapter summary
+        timeout-minutes: 8
+        env:
+          ACCEPTANCE_VIDEO_ID: ${{ inputs.video_id }}
+        run: node scripts/verify-deployment.mjs "$RUNNER_TEMP/worker-deployment.jsonl"

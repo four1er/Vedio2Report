@@ -57,7 +57,7 @@ function showSample() {
   if (pending) { tell('正在生成文章。如需切换到示例，请先停止生成。'); feedback.scrollIntoView({ block: 'center' }); return; }
   openResult(true);
   markdown = sampleMarkdown;
-  source.textContent = '预置试读稿与总结 · 根据示例主题编写，未经现场转录。';
+  source.textContent = '原创试读稿 · 正文和六项总结均为预置示例。';
   renderArticle(markdown, body, title, sampleChapters, async id => sampleSummaries[id]);
   copy.hidden = false;
 }
@@ -93,7 +93,6 @@ function setBusy(busy: boolean) {
   element('submit-caption').textContent = busy ? '生成中…' : '开始生成';
 }
 function sourceName(kind: string) {
-  if (kind === 'sample') return '内置示例素材 · 根据示例主题编写，非视频逐字稿';
   if (kind === 'cached') return 'W3C WAI 官方存档字幕';
   return 'YouTube 视频字幕';
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getCaptions, parseVideoId } from "../src/worker/captions";
-import { sampleVideoId } from "../src/worker/sample";
+const referenceVideoId = "xRh2sVcNXQ8";
 
 const otherId = "fHsa9Dqm0CU";
 const timedtextUrl = (id: string) => `https://www.youtube.com/api/timedtext?v=${id}&sig=unchanged`;
@@ -60,9 +60,9 @@ describe("caption acquisition", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("uses the explicitly labeled example only for the matching video", async () => {
+  it("reports missing captions for the reference interview and other unarchived videos", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("blocked", {status: 429}))));
-    expect(await getCaptions(sampleVideoId)).toMatchObject({ source: "sample", text: expect.stringContaining("原创演示对话") });
+    await expect(getCaptions(referenceVideoId)).rejects.toThrow("可读取的字幕");
     await expect(getCaptions(otherId)).rejects.toThrow("可读取的字幕");
   });
 
@@ -90,7 +90,7 @@ it("counts non-BMP caption characters as four UTF-8 bytes", async () => {
 });
 
 it.each([
-  ["mismatched video id", timedtextUrl(sampleVideoId)],
+  ["mismatched video id", timedtextUrl(referenceVideoId)],
   ["unrelated YouTube path", `https://www.youtube.com/redirect?v=${otherId}`],
   ["nonstandard port", `https://www.youtube.com:9876/api/timedtext?v=${otherId}`],
   ["userinfo", `https://unknown@www.youtube.com/api/timedtext?v=${otherId}`],

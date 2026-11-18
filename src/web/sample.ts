@@ -4,7 +4,7 @@ export const sampleChapters: Chapter[] = [
   { id: 'ch-1', title: '智能经济：收入爆发与成本塌陷' },
   { id: 'ch-2', title: '商业模式：谁会为智能付费' },
 ];
-export const sampleMarkdown = `# 对话安德森：AI 革命的万亿美金之问
+export const sampleMarkdown = `# 谁会为 AI 付费？
 
 当智能成为可以按次购买的服务，真正值得追问的，既有一条回答的价格，也有这条回答为使用者节省的时间。
 

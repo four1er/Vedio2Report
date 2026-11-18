@@ -21,7 +21,7 @@ Wrangler 启动本地 Worker，默认端口为 8787。修改前端时，可在�
 
 1. 在 Cloudflare 的 Workers & Pages 中启用账号的 `workers.dev` 子域，记下 Account ID，并创建限定到目标账号、能够编辑 Workers 的 API Token。
 2. 在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中新增三个 repository secrets：`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN`、`GEMINI_API_KEY`。最后一项使用 AI Studio 签发的实际密钥。
-3. 在 **Actions → Deploy Worker → Run workflow** 选择 `main`。工作流先测试和构建，再将静态网页、Worker 和 Gemini secret 一并部署。部署步骤的 Wrangler 输出会给出该账号下的公开网址。[部署工作流](.github/workflows/deploy.yml)
+3. 在 **Actions → Deploy Worker → Run workflow** 选择 `main`。验收视频默认使用 W3C；也可在 `video_id` 填入其他公开视频的 11 位 ID，检验实时字幕提取。工作流先测试和构建，再将静态网页、Worker 和 Gemini secret 一并部署。部署后工作流打开 Wrangler 实际返回的公网地址，用所选视频生成一篇中文文章，再请求首章 5W1H。成功后对应运行的 Summary 中会显示公开网址、首个正文片段耗时和增量事件数。该验收会使用一次文章生成和一次总结的 Gemini 配额。[部署工作流](.github/workflows/deploy.yml)
 
 Wrangler 配置包含 SQLite Durable Object 的首次迁移、静态资源绑定和限流绑定。后续发布使用同一 Worker 名称。可在配置的 `vars` 中设置 `GEMINI_MODEL` 以固定账号支持的模型。[Worker 配置](wrangler.jsonc)
 
@@ -38,7 +38,7 @@ Wrangler 配置包含 SQLite Durable Object 的首次迁移、静态资源绑定
 ### 字幕受限时的行为
 
 - **W3C 官方字幕存档**。W3C 视频的线上字幕读取失败时，使用 *Evaluating Web Accessibility: Resources Overview* 的官方英文逐字稿，保留口述文本并省略视觉描述和时间轴。作者为 W3C Web Accessibility Initiative (WAI), Education and Outreach Working Group。文章由本项目独立生成。[原始字幕和授权说明](https://www.w3.org/WAI/test-evaluate/#transcript) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
-- **安德森访谈示例**。题目中的视频优先尝试真实字幕。失败时使用根据题面编写的原创演示对话，页面显示「内置示例素材」，并将来源说明传给模型。首页的预置试读也单独标识。[参考视频](https://www.youtube.com/watch?v=xRh2sVcNXQ8)
+- **安德森访谈示例**。文章基于该视频的实际字幕生成。获取失败时提示字幕不可用，用户可选择带官方存档的 W3C 视频。首页另有独立标注的原创排版示例。[参考视频](https://www.youtube.com/watch?v=xRh2sVcNXQ8)
 - **其他视频**。遇到验证码、私有视频、无字幕或字幕不可读时，界面提示更换视频。当前实现直接使用 Worker 的 HTTPS fetch，省去额外代理服务。字幕文本上限为 100 KB，避免长视频被静默截断后生成一篇看似完整的文章。
 
 ## 验证
