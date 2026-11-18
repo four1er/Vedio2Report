@@ -1,12 +1,13 @@
 import { cachedCaptions, cachedVideoId } from "./sample";
+import interview from "./archives/xRh2sVcNXQ8.json";
+import { ApiError } from "./protocol";
 
 const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
 const youtubeHosts = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]);
 const invalidLink = "请输入有效的 YouTube 视频链接，例如 youtube.com/watch?v=… 或 youtu.be/…。";
 const unavailable = "YouTube 暂时没有返回可读取的字幕。请确认视频公开且有字幕，或尝试示例链接。";
 
-type Source = {source: "youtube" | "cached"; title: string; text: string}
-  | {source: "youtube-video"; title: string; text?: undefined};
+type Source = {source: "youtube" | "cached" | "archived-youtube"; title: string; text: string};
 export type Video = Source & {videoId: string};
 
 export function parseVideoId(input: string): string {
@@ -113,10 +114,14 @@ async function liveCaptions(videoId: string): Promise<Source> {
 
 export async function getVideoSource(videoId: string): Promise<Source> {
   if (!videoIdPattern.test(videoId)) throw new Error(invalidLink);
+  if (videoId === interview.videoId) {
+    return {source: "archived-youtube", title: interview.title, text: interview.text};
+  }
   try {
     return await liveCaptions(videoId);
-  } catch {
+  } catch (error) {
     if (videoId === cachedVideoId) return cachedCaptions;
-    return {source: "youtube-video", title: ""};
+    if (error instanceof Error && /^字幕(源文件过大|过长)/.test(error.message)) throw new ApiError(422, error.message);
+    throw new ApiError(422, unavailable);
   }
 }

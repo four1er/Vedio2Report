@@ -73,7 +73,7 @@ element('fill').addEventListener('click', () => {
 });
 input.addEventListener('input', () => {
   input.setCustomValidity('');
-  element('url-hint').textContent = '支持 YouTube 公开视频。';
+  element('url-hint').textContent = '支持带字幕的 YouTube 公开视频。';
 });
 stop.addEventListener('click', () => pending?.abort());
 
@@ -94,7 +94,7 @@ function setBusy(busy: boolean) {
 }
 function sourceName(kind: string) {
   if (kind === 'cached') return 'W3C WAI 官方存档字幕';
-  if (kind === 'youtube-video') return 'YouTube 原视频（Gemini 影音输入）';
+  if (kind === 'archived-youtube') return 'YouTube 英文字幕存档';
   return 'YouTube 视频字幕';
 }
 form.addEventListener('submit', async event => {
@@ -123,7 +123,7 @@ form.addEventListener('submit', async event => {
         id = data.articleId;
         source.textContent = sourceName(data.source);
         if (data.title) source.append(document.createTextNode(' · ' + data.title));
-        status.textContent = data.source === 'youtube-video' ? '正在读取原视频，长访谈可能需要稍等片刻…' : 'Gemini 正在写作，正文将实时出现…';
+        status.textContent = '已取得字幕，正在等待 Gemini 输出正文…';
       } else if (type === 'delta' && typeof data.text === 'string') {
         if (!markdown) status.textContent = 'Gemini 正在写作…';
         markdown += data.text;

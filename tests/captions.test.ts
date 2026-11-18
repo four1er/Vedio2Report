@@ -56,21 +56,25 @@ describe("caption acquisition", () => {
   it("refuses caption URLs outside the timedtext endpoint before fetching", async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(watchPage(otherId, `https://evil.example/api/timedtext?v=${otherId}`));
     vi.stubGlobal("fetch", fetcher);
-    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+    await expect(getVideoSource(otherId)).rejects.toThrow("可读取的字幕");
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("selects the original video for the reference interview and other unarchived videos", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("blocked", {status: 429}))));
-    expect(await getVideoSource(referenceVideoId)).toEqual({source: "youtube-video", title: ""});
-    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+  it("serves the complete matching archive offline and reports unavailable captions for other videos", async () => {
+    const fetcher = vi.fn(() => Promise.resolve(new Response("blocked", {status: 429})));
+    vi.stubGlobal("fetch", fetcher);
+    const reference = await getVideoSource(referenceVideoId);
+    expect(reference.source).toBe("archived-youtube");
+    expect(reference.text.split("\n")).toHaveLength(2801);
+    expect(fetcher).not.toHaveBeenCalled();
+    await expect(getVideoSource(otherId)).rejects.toThrow("可读取的字幕");
   });
 
-  it("switches to the original video if the full transcript exceeds the text budget", async () => {
+  it("rejects an oversized live transcript without sending it to Gemini", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
       Response.json({events: [{segs: [{utf8: "文".repeat(34_000)}]}]}),
     ));
-    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+    await expect(getVideoSource(otherId)).rejects.toThrow("字幕过长");
   });
 });
 
@@ -86,7 +90,7 @@ it("counts non-BMP caption characters as four UTF-8 bytes", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
     Response.json({events: [{segs: [{utf8: "🔔".repeat(25_001)}]}]}),
   ));
-  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+  await expect(getVideoSource(otherId)).rejects.toThrow("字幕过长");
 });
 
 it.each([
@@ -97,7 +101,7 @@ it.each([
 ])("drops a track with %s", async (_label, captionUrl) => {
   const fetcher = vi.fn().mockResolvedValueOnce(watchPage(otherId, captionUrl));
   vi.stubGlobal("fetch", fetcher);
-  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+  await expect(getVideoSource(otherId)).rejects.toThrow("可读取的字幕");
   expect(fetcher).toHaveBeenCalledTimes(1);
   expect(fetcher.mock.calls[0][1].redirect).toBe("manual");
 });
@@ -107,7 +111,7 @@ it.each(["watch", "track"])("rejects %s redirects without following Location", a
   if (stage === "track") fetcher.mockResolvedValueOnce(watchPage(otherId));
   fetcher.mockResolvedValueOnce(Response.redirect("https://untrusted.example/target", 302));
   vi.stubGlobal("fetch", fetcher);
-  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
+  await expect(getVideoSource(otherId)).rejects.toThrow("可读取的字幕");
   expect(fetcher).toHaveBeenCalledTimes(stage === "watch" ? 1 : 2);
   expect(fetcher.mock.calls.every(([, options]) => options.redirect === "manual")).toBe(true);
 });

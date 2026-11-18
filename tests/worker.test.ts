@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { ArticleSession } from "../src/worker/index";
 import { getVideoSource } from "../src/worker/captions";
+import { ApiError } from "../src/worker/protocol";
 
 vi.mock("../src/worker/captions", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/worker/captions")>(),
@@ -68,11 +69,9 @@ function fixture() {
   };
 }
 
-const videoUsage = {promptTokensDetails: [{modality: "VIDEO", tokenCount: 150000}]};
-
-function geminiFrame(text: string, finishReason?: string, usageMetadata?: typeof videoUsage) {
+function geminiFrame(text: string, finishReason?: string) {
   const candidate = { content: { parts: [{ text }] }, finishReason };
-  return new TextEncoder().encode(`data: ${JSON.stringify({ candidates: [candidate], usageMetadata })}\r\n\r\n`);
+  return new TextEncoder().encode(`data: ${JSON.stringify({ candidates: [candidate] })}\r\n\r\n`);
 }
 
 function readEvents(response: Response) {
@@ -104,48 +103,34 @@ afterEach(() => {
 });
 
 describe("Worker article workflow", () => {
-  it("writes and summarizes from the original interview, then translates only the six fields if needed", async () => {
+  it("sends only text for the archived interview, its summary, and any translation", async () => {
     const app = fixture();
-    vi.mocked(getVideoSource).mockResolvedValueOnce({source: "youtube-video", title: ""});
+    vi.mocked(getVideoSource).mockResolvedValueOnce({source: "archived-youtube", title: "访谈", text: transcript});
     const requests: string[] = [];
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const req = new Request(input, init);
       const parts = (await req.json()).contents[0].parts;
+      expect(parts).toEqual([{text: expect.any(String)}]);
+      const material = JSON.parse(parts[0].text);
       requests.push(req.url);
-      if (parts.length === 1) {
-        expect(JSON.parse(parts[0].text).summary.what).toBe("Ocean monitoring");
+      if (material.summary) {
+        expect(material.summary.what).toBe("Ocean monitoring");
         return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
       }
-      expect(parts[0].fileData.fileUri).toBe(url);
-      expect(JSON.parse(parts[1].text).video.videoId).toBe("xRh2sVcNXQ8");
-      if (req.url.includes(":streamGenerateContent")) {
-        return new Response(geminiFrame(firstPart, "STOP", videoUsage));
-      }
-      expect(JSON.parse(parts[1].text).chapter.title).toBe("观测站");
-      return Response.json({usageMetadata: videoUsage, candidates: [
-        {content: {parts: [{text: JSON.stringify({...summary, what: "Ocean monitoring"})}]}, finishReason: "STOP"},
-      ]});
+      expect(material.video.text).toBe(transcript);
+      if (req.url.includes(":streamGenerateContent")) return new Response(geminiFrame(firstPart, "STOP"));
+      expect(material.chapter.title).toBe("观测站");
+      return Response.json({candidates: [{content: {parts: [{text: JSON.stringify({...summary, what: "Ocean monitoring"})}]}, finishReason: "STOP"}]});
     });
     const events = readEvents(await app.post("/api/articles", {url}));
     const meta = await events.next();
-    expect(meta.data.source).toBe("youtube-video");
+    expect(meta.data.source).toBe("archived-youtube");
     expect((await events.next()).data.text).toBe(firstPart);
     expect((await events.next()).event).toBe("done");
     const path = `/api/articles/${meta.data.articleId}/chapters/ch-1/summary`;
     expect(await (await app.post(path)).json()).toEqual(summary);
     expect(await (await app.post(path)).json()).toEqual(summary);
     expect(requests).toHaveLength(3);
-  });
-
-  it("withholds an ungrounded response when Gemini reports no video or audio input", async () => {
-    const app = fixture();
-    vi.mocked(getVideoSource).mockResolvedValueOnce({source: "youtube-video", title: ""});
-    vi.stubGlobal("fetch", async () => new Response(geminiFrame(firstPart, "STOP")));
-    const events = readEvents(await app.post("/api/articles", {url}));
-    const meta = await events.next();
-    expect((await events.next()).event).toBe("error");
-    const result = await app.post(`/api/articles/${meta.data.articleId}/chapters/ch-1/summary`);
-    expect(result.status).toBe(404);
   });
 
   it("delivers the first delta before upstream completion and summarizes using stored context", async () => {
@@ -218,6 +203,16 @@ describe("Worker article workflow", () => {
     const res = await app.post("/api/articles", { url: "https://example.org/watch?v=xRh2sVcNXQ8" });
     expect(res.status).toBe(400);
     expect(getVideoSource).not.toHaveBeenCalled();
+  });
+
+  it("ends an unavailable-caption request before calling Gemini", async () => {
+    const app = fixture();
+    vi.mocked(getVideoSource).mockRejectedValueOnce(new ApiError(422, "暂时无法读取字幕。"));
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const result = await app.post("/api/articles", {url});
+    expect(result.status).toBe(422);
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("returns an actionable service error when the Gemini key is absent", async () => {

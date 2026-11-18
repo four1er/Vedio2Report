@@ -86,7 +86,9 @@ export class ArticleSession {
     if (!video || !article) throw new ApiError(404, '文章上下文已失效。')
     const chapter: Chapter | undefined = extractChapters(article).find(item => item.id === id)
     if (!chapter) throw new ApiError(404, '未找到该章节。')
-    const result = await summarize(this.env, video, article, chapter, AbortSignal.timeout(90_000))
+    // Sessions from the former video-input path stored an ID without caption text.
+    const context = video.text ? video : {...await getVideoSource(video.videoId), videoId: video.videoId}
+    const result = await summarize(this.env, context, article, chapter, AbortSignal.timeout(90_000))
     if (session.expiresAt <= Date.now()) throw new ApiError(404, '文章已过期，请重新生成。')
     await this.state.storage.put('summary/' + id, result)
     return result

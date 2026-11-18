@@ -28,7 +28,7 @@
         <div class="intro-copy">
           <p class="eyebrow"><span class="short-rule"></span>视频对话写作台</p>
           <h1 id="intro-title">把视频对话，<br />读成<span>一篇文章。</span></h1>
-          <p class="intro-description">根据 YouTube 字幕或原视频，用 Gemini 写成分章中文文章。</p>
+          <p class="intro-description">根据 YouTube 字幕，用 Gemini 写成分章中文文章。</p>
         </div>
         <img class="hero-art" src="/editorial-art.webp" alt="" width="544" height="320" fetchpriority="high" />
       </section>
@@ -44,10 +44,10 @@
               <button id="fill" class="text-button" type="button">填入示例链接<span data-icon="corner"></span></button>
             </div>
             <div class="input-wrap"><span data-icon="link"></span><input id="video" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" required autocomplete="url" aria-describedby="url-hint" maxlength="2048" /></div>
-            <p class="hint" id="url-hint">支持 YouTube 公开视频。</p>
+            <p class="hint" id="url-hint">支持带字幕的 YouTube 公开视频。</p>
             <div class="label-row prompt-label"><label for="requirements">写作要求<span class="optional">选填</span></label></div>
             <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如：写给产品经理，用访谈风格，保留关键数据，分三章展开。"></textarea>
-            <div class="form-actions"><button type="submit" class="primary" id="submit"><span data-icon="pen"></span><span id="submit-caption">开始生成</span><span data-icon="arrow"></span></button><button type="button" id="stop" class="subtle" hidden>停止生成</button></div>
+            <div class="form-actions"><button type="submit" class="primary" id="submit"><span data-icon="pen"></span><span id="submit-caption">开始生成</span><span data-icon="arrow"></span></button></div>
             <p id="feedback" role="alert" hidden></p>
           </form>
         </section>
@@ -66,7 +66,7 @@
         </aside>
       </div>
       <section id="article" class="reader panel" hidden aria-labelledby="reader-title">
-        <div class="reader-bar"><p class="eyebrow"><span class="small-dot"></span><span id="reader-mode"></span></p><button id="copy" class="text-button" type="button" hidden><span data-icon="copy"></span><span id="copy-label">复制正文</span></button></div>
+        <div class="reader-bar"><p class="eyebrow"><span class="small-dot"></span><span id="reader-mode"></span></p><button type="button" id="stop" class="subtle" hidden>停止生成</button><button id="copy" class="text-button" type="button" hidden><span data-icon="copy"></span><span id="copy-label">复制正文</span></button></div>
         <h2 id="reader-title" tabindex="-1">生成结果</h2>
         <p class="reader-source" id="reader-source"></p>
         <p class="reader-status" id="reader-status" role="status"></p>

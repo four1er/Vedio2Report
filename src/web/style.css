@@ -99,7 +99,7 @@ textarea {resize:vertical;min-height:76px;display:block;line-height:1.65}
 .read-button {margin-top:16px;gap:8px;font-weight:650;border:0;background:transparent;padding:0;color:var(--ink);font-size:13px}
 .read-button svg {width:16px;height:16px}
 .read-button [data-icon="arrow"] {margin-left:7px}
-.reader {max-width:900px;margin:32px auto 0;padding:28px clamp(20px,6vw,76px) 44px;scroll-margin-top:14px}
+.reader {max-width:900px;margin:32px auto 0;padding:28px clamp(20px,6vw,76px) 44px;scroll-margin-top:14px;min-height:calc(100svh - 28px)}
 .reader-bar {justify-content:space-between;min-height:30px;margin-bottom:16px}
 .reader h2 {font-size:clamp(29px,4vw,43px);line-height:1.45}
 .reader-source,.reader-status {font-size:13px;color:var(--muted);margin:10px 0}

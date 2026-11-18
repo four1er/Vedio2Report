@@ -37,7 +37,7 @@ it("runs live subtitle extraction, Gemini streaming and cached 5W1H in workerd",
       const material = JSON.parse(payload.contents[0].parts[0].text);
       expect(material.video.text).toBe(transcript);
       if (pathname.endsWith(":streamGenerateContent")) {
-        expect(material.requirements).toBe("给中学生");
+        expect(JSON.parse(payload.contents[0].parts[1].text).requirements).toBe("给中学生");
         const chunks = [article.slice(0, 8), article.slice(8)].map((text, i) => {
           const candidate = { content: { parts: [{ text }] }, finishReason: i === 1 ? "STOP" : undefined };
           return "data: " + JSON.stringify({ candidates: [candidate] }) + "\n\n";
