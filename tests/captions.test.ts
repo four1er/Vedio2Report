@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getCaptions, parseVideoId } from "../src/worker/captions";
+import { getVideoSource, parseVideoId } from "../src/worker/captions";
 const referenceVideoId = "xRh2sVcNXQ8";
 
 const otherId = "fHsa9Dqm0CU";
@@ -45,7 +45,7 @@ describe("caption acquisition", () => {
         { segs: [{ utf8: " \n" }] }, { segs: [{ utf8: "第二句。" }] }] }),
     );
     vi.stubGlobal("fetch", fetcher);
-    expect(await getCaptions(otherId)).toEqual({ text: "第一句。\n第二句。", source: "youtube", title: '含有 "a}b" 的标题' });
+    expect(await getVideoSource(otherId)).toEqual({ text: "第一句。\n第二句。", source: "youtube", title: '含有 "a}b" 的标题' });
     const track = new URL(fetcher.mock.calls[1][0]);
     expect(track.searchParams.get("fmt")).toBe("json3");
     expect(track.searchParams.get("sig")).toBe("unchanged");
@@ -56,29 +56,29 @@ describe("caption acquisition", () => {
   it("refuses caption URLs outside the timedtext endpoint before fetching", async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(watchPage(otherId, `https://evil.example/api/timedtext?v=${otherId}`));
     vi.stubGlobal("fetch", fetcher);
-    await expect(getCaptions(otherId)).rejects.toThrow("可读取的字幕");
+    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  it("reports missing captions for the reference interview and other unarchived videos", async () => {
+  it("selects the original video for the reference interview and other unarchived videos", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("blocked", {status: 429}))));
-    await expect(getCaptions(referenceVideoId)).rejects.toThrow("可读取的字幕");
-    await expect(getCaptions(otherId)).rejects.toThrow("可读取的字幕");
+    expect(await getVideoSource(referenceVideoId)).toEqual({source: "youtube-video", title: ""});
+    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
   });
 
-  it("rejects transcripts beyond the model's input budget before generation", async () => {
+  it("switches to the original video if the full transcript exceeds the text budget", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
       Response.json({events: [{segs: [{utf8: "文".repeat(34_000)}]}]}),
     ));
-    await expect(getCaptions(otherId)).rejects.toThrow("字幕过长");
+    expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
   });
 });
 
 it("preserves a genuine licensed transcript for the W3C video when YouTube is unavailable", async () => {
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("fetch failed")));
-  const result = await getCaptions("C4GIqWeywiI");
+  const result = await getVideoSource("C4GIqWeywiI");
   expect(result.source).toBe("cached");
-  expect(result.text.split("\n")).toHaveLength(14);
+  expect(result.text?.split("\n")).toHaveLength(14);
   expect(result.text).toContain("Web Accessibility Evaluation Tools List");
 });
 
@@ -86,7 +86,7 @@ it("counts non-BMP caption characters as four UTF-8 bytes", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
     Response.json({events: [{segs: [{utf8: "🔔".repeat(25_001)}]}]}),
   ));
-  await expect(getCaptions(otherId)).rejects.toThrow("字幕过长");
+  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
 });
 
 it.each([
@@ -97,7 +97,7 @@ it.each([
 ])("drops a track with %s", async (_label, captionUrl) => {
   const fetcher = vi.fn().mockResolvedValueOnce(watchPage(otherId, captionUrl));
   vi.stubGlobal("fetch", fetcher);
-  await expect(getCaptions(otherId)).rejects.toThrow("可读取的字幕");
+  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
   expect(fetcher).toHaveBeenCalledTimes(1);
   expect(fetcher.mock.calls[0][1].redirect).toBe("manual");
 });
@@ -107,7 +107,7 @@ it.each(["watch", "track"])("rejects %s redirects without following Location", a
   if (stage === "track") fetcher.mockResolvedValueOnce(watchPage(otherId));
   fetcher.mockResolvedValueOnce(Response.redirect("https://untrusted.example/target", 302));
   vi.stubGlobal("fetch", fetcher);
-  await expect(getCaptions(otherId)).rejects.toThrow("可读取的字幕");
+  expect(await getVideoSource(otherId)).toEqual({source: "youtube-video", title: ""});
   expect(fetcher).toHaveBeenCalledTimes(stage === "watch" ? 1 : 2);
   expect(fetcher.mock.calls.every(([, options]) => options.redirect === "manual")).toBe(true);
 });

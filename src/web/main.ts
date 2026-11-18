@@ -65,15 +65,15 @@ element('sample').addEventListener('click', showSample);
 navSample.addEventListener('click', event => { event.preventDefault(); showSample(); });
 navStudio.addEventListener('click', () => { switchNav(false); input.focus({ preventScroll: true }); });
 element('fill').addEventListener('click', () => {
-  input.value = 'https://www.youtube.com/watch?v=C4GIqWeywiI';
+  input.value = 'https://www.youtube.com/watch?v=xRh2sVcNXQ8';
   input.setCustomValidity('');
-  element('url-hint').textContent = '已填入 W3C 无障碍影片，可使用官方存档字幕。';
+  element('url-hint').textContent = '已填入马克·安德森访谈。';
   tell('');
   input.focus();
 });
 input.addEventListener('input', () => {
   input.setCustomValidity('');
-  element('url-hint').textContent = '支持带字幕的公开视频。';
+  element('url-hint').textContent = '支持 YouTube 公开视频。';
 });
 stop.addEventListener('click', () => pending?.abort());
 
@@ -94,6 +94,7 @@ function setBusy(busy: boolean) {
 }
 function sourceName(kind: string) {
   if (kind === 'cached') return 'W3C WAI 官方存档字幕';
+  if (kind === 'youtube-video') return 'YouTube 原视频（Gemini 影音输入）';
   return 'YouTube 视频字幕';
 }
 form.addEventListener('submit', async event => {
@@ -122,8 +123,9 @@ form.addEventListener('submit', async event => {
         id = data.articleId;
         source.textContent = sourceName(data.source);
         if (data.title) source.append(document.createTextNode(' · ' + data.title));
-        status.textContent = 'Gemini 正在写作，正文将实时出现…';
+        status.textContent = data.source === 'youtube-video' ? '正在读取原视频，长访谈可能需要稍等片刻…' : 'Gemini 正在写作，正文将实时出现…';
       } else if (type === 'delta' && typeof data.text === 'string') {
+        if (!markdown) status.textContent = 'Gemini 正在写作…';
         markdown += data.text;
         if (!frame) frame = requestAnimationFrame(() => { frame = 0; renderArticle(markdown, body, title); });
       } else if (type === 'error') {

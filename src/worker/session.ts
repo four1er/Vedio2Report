@@ -1,11 +1,10 @@
-import { getCaptions } from './captions'
+import { getVideoSource, type Video } from './captions'
 import { summarize, writeArticle } from './gemini'
 import { ApiError, extractChapters, failure, json } from './protocol'
 import type { Bindings, Chapter, Summary } from './protocol'
 
 const lifetime = 24 * 60 * 60 * 1000
 const encoder = new TextEncoder()
-type Video = Awaited<ReturnType<typeof getCaptions>> & { videoId: string }
 interface Session { expiresAt: number; requirements: string }
 type StreamEvent = [name: string, data: unknown]
 
@@ -40,13 +39,9 @@ export class ArticleSession {
       const path = new URL(request.url).pathname
       if (path === '/generate') {
         const {videoId, requirements} = await request.json() as {videoId: string; requirements: string}
-        let captions: Awaited<ReturnType<typeof getCaptions>>
-        try { captions = await getCaptions(videoId) }
-        catch (error) { throw new ApiError(422, error instanceof Error ? error.message : '无法读取视频字幕。') }
-        if (!captions.text.trim() || encoder.encode(captions.text).length > 100_000)
-          throw new ApiError(422, '字幕为空或过长，请更换视频。')
+        const source = await getVideoSource(videoId)
         const controller = new AbortController()
-        const events = this.generate({...captions, videoId}, requirements, controller.signal)
+        const events = this.generate({...source, videoId}, requirements, controller.signal)
         return eventStream(events, controller)
       }
       const match = /^\/summary\/(ch-[1-9]\d*)$/.exec(path)

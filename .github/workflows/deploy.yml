@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       video_id:
-        description: '验收用 YouTube 视频 ID（默认 W3C，检验实时字幕可换其他公开视频）'
+        description: '验收用 YouTube 视频 ID（默认马克·安德森访谈）'
         type: string
-        default: C4GIqWeywiI
+        default: xRh2sVcNXQ8
 permissions:
   contents: read
 concurrency:

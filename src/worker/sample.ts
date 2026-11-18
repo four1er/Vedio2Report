@@ -6,7 +6,7 @@
 export const cachedVideoId = "C4GIqWeywiI";
 
 export const cachedCaptions = {
-  source: "cached",
+  source: "cached" as const,
   title: "Evaluating Web Accessibility: Resources Overview",
   text: `Evaluating web accessibility: resources overview
 Evaluation helps you ensure that your websites and applications meet accessibility requirements.

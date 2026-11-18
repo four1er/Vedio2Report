@@ -5,6 +5,10 @@ const youtubeHosts = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]
 const invalidLink = "请输入有效的 YouTube 视频链接，例如 youtube.com/watch?v=… 或 youtu.be/…。";
 const unavailable = "YouTube 暂时没有返回可读取的字幕。请确认视频公开且有字幕，或尝试示例链接。";
 
+type Source = {source: "youtube" | "cached"; title: string; text: string}
+  | {source: "youtube-video"; title: string; text?: undefined};
+export type Video = Source & {videoId: string};
+
 export function parseVideoId(input: string): string {
   let url: URL;
   try {
@@ -82,7 +86,7 @@ function rank(track: CaptionTrack): number {
   return (track.kind === "asr" ? 4 : 0) + (lang === "zh" ? 0 : lang === "en" ? 1 : 2);
 }
 
-async function liveCaptions(videoId: string) {
+async function liveCaptions(videoId: string): Promise<Source> {
   const signal = AbortSignal.timeout(10000);
   const html = await readLimited(`https://www.youtube.com/watch?v=${videoId}&hl=en`, 5_000_000, signal);
   const player = playerFromHtml(html);
@@ -107,14 +111,12 @@ async function liveCaptions(videoId: string) {
   return {text, title: player.videoDetails?.title || "YouTube 视频", source: "youtube"};
 }
 
-export async function getCaptions(videoId: string): Promise<{text: string; title: string; source: string}> {
+export async function getVideoSource(videoId: string): Promise<Source> {
   if (!videoIdPattern.test(videoId)) throw new Error(invalidLink);
   try {
     return await liveCaptions(videoId);
-  } catch (err) {
+  } catch {
     if (videoId === cachedVideoId) return cachedCaptions;
-    // Network and JSON parser exceptions can contain signed URLs or fragments of upstream HTML.
-    if (err instanceof Error && /^字幕(源文件过大|过长)/.test(err.message)) throw err;
-    throw new Error(unavailable);
+    return {source: "youtube-video", title: ""};
   }
 }
