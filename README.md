@@ -2,7 +2,9 @@
 
 把有字幕的 YouTube 对话整理成分章中文文章。读者可以限定写作风格、受众、任务和篇幅，在 Gemini 写作时阅读正文，再点击章节标题旁的 **5W1H** 展开总结。
 
-**试用素材**　点击「填入示例链接」选择 W3C 的无障碍评估短片，再点「开始生成」。例如，写作要求可填「写给第一次参与无障碍测试的产品经理，按评估时机和工具选择分为两章」。首页的「阅读示例」可直接体验预置文章与六项总结，无需 API 密钥。[W3C 示例视频](https://www.youtube.com/watch?v=C4GIqWeywiI) · [项目验收目标](PROJECT.md)
+[打开声稿写作台](https://vedio2report.tf08202000.workers.dev) · [GitHub 仓库](https://github.com/four1er/Vedio2Report)
+
+**试用素材**　点击「填入示例链接」填入 W3C 的无障碍评估短片，再点「开始生成」。例如，写作要求可填「写给第一次参与无障碍测试的产品经理，按评估时机和工具选择分为两章」。首页的「阅读示例」可直接体验预置文章与六项总结，无需 API 密钥。[W3C 示例视频](https://www.youtube.com/watch?v=C4GIqWeywiI) · [项目验收目标](PROJECT.md)
 
 ## 本地运行
 
@@ -38,7 +40,7 @@ Wrangler 配置包含 SQLite Durable Object 的首次迁移、静态资源绑定
 ### 字幕受限时的行为
 
 - **W3C 官方字幕存档**。W3C 视频的线上字幕读取失败时，使用 *Evaluating Web Accessibility: Resources Overview* 的官方英文逐字稿，保留口述文本并省略视觉描述和时间轴。作者为 W3C Web Accessibility Initiative (WAI), Education and Outreach Working Group。文章由本项目独立生成。[原始字幕和授权说明](https://www.w3.org/WAI/test-evaluate/#transcript) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
-- **安德森访谈示例**。文章基于该视频的实际字幕生成。获取失败时提示字幕不可用，用户可选择带官方存档的 W3C 视频。首页另有独立标注的原创排版示例。[参考视频](https://www.youtube.com/watch?v=xRh2sVcNXQ8)
+- **安德森访谈**。生成文章需要读取该视频的实际字幕。2026-11-19 公网验收时，YouTube 未返回可读字幕，页面提示更换视频。首页另有独立标注的原创排版示例。[参考视频](https://www.youtube.com/watch?v=xRh2sVcNXQ8)
 - **其他视频**。遇到验证码、私有视频、无字幕或字幕不可读时，界面提示更换视频。当前实现直接使用 Worker 的 HTTPS fetch，省去额外代理服务。字幕文本上限为 100 KB，避免长视频被静默截断后生成一篇看似完整的文章。
 
 ## 验证
@@ -51,3 +53,11 @@ npx wrangler deploy --dry-run
 ```
 
 测试覆盖字幕轨道选择与回退、跨网络块的中文字符、文章未结束时的增量输出、生成中断、仅凭 ID 总结和缓存命中。运行时集成测试启动真实 workerd 与 SQLite Durable Object，上游 YouTube 和 Gemini 使用可控响应。真实 API 联调需要可用的 Gemini 密钥及网络。
+
+2026-11-19 使用 W3C 官方存档字幕完成公网验收。自提交视频起，1.07 秒收到 Gemini 的首个正文片段，2.2 秒收到全文，共 17 个增量事件。随后仅用文章和章节 ID 请求首章总结，Who、What、When、Where、Why、How 均返回了内容。
+
+在项目根目录使用 Node.js 24 可复验当前部署。脚本会生成一篇新文章并请求首章总结，使用部署端的 Gemini 配额。
+
+```sh
+node scripts/verify-deployment.mjs https://vedio2report.tf08202000.workers.dev
+```

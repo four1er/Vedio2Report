@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict';
 import { appendFile, readFile } from 'node:fs/promises';
 import { setTimeout as pause } from 'node:timers/promises';
-import { events } from '../src/web/stream.ts';
+import { events, responseError } from '../src/web/stream.ts';
 
-const records = (await readFile(process.argv[2], 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-const deployed = records.findLast(row => row.type === 'deploy' && row.version === 1 && row.version_id);
-const origin = deployed?.targets?.find(target => /^https:\/\/vedio2report\.[a-z0-9-]+\.workers\.dev$/.test(target));
-assert.ok(origin, 'Wrangler did not report a deployed vedio2report workers.dev URL.');
+const workerUrl = /^https:\/\/vedio2report\.[a-z0-9-]+\.workers\.dev$/;
+async function resolveOrigin(input) {
+  assert.ok(input, 'Pass a vedio2report workers.dev URL or a Wrangler deployment JSONL file.');
+  if (input.startsWith('https://')) {
+    const url = input.replace(/\/$/, '');
+    assert.match(url, workerUrl, 'Expected the public vedio2report workers.dev URL');
+    return url;
+  }
+  const records = (await readFile(input, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  const deployed = records.findLast(row => row.type === 'deploy' && row.version === 1 && row.version_id);
+  const url = deployed?.targets?.find(target => workerUrl.test(target));
+  assert.ok(url, 'Wrangler did not report a deployed vedio2report workers.dev URL.');
+  return url;
+}
+const origin = await resolveOrigin(process.argv[2]);
 console.log('Public Worker:', origin);
 
 async function checkPage() {
@@ -38,7 +49,7 @@ const article = await fetch(origin + '/api/articles', {
   }),
   signal: AbortSignal.timeout(210_000),
 });
-assert.equal(article.status, 200, 'Article HTTP status');
+if (!article.ok) throw await responseError(article, '文章请求失败');
 let articleId, chapterId, firstDeltaMs, source;
 let deltas = 0, markdown = '';
 for await (const { type, data } of events(article)) {
@@ -59,7 +70,7 @@ for await (const { type, data } of events(article)) {
     chapterId = data.chapters?.[0]?.id;
     assert.match(chapterId, /^ch-[1-9]\d*$/);
   } else if (type === 'error') {
-    throw new Error('The Worker reported a generation error. Check the Gemini configuration and quota.');
+    throw new Error(data.message || '文章生成中断');
   }
 }
 assert.ok(articleId && chapterId && /^##\s+.+/m.test(markdown) && /\p{Script=Han}/u.test(markdown),
@@ -68,7 +79,7 @@ const seconds = ((performance.now() - started) / 1000).toFixed(1);
 const summary = await fetch(origin + '/api/articles/' + articleId + '/chapters/' + chapterId + '/summary', {
   method: 'POST', signal: AbortSignal.timeout(105_000),
 });
-assert.equal(summary.status, 200, '5W1H HTTP status');
+if (!summary.ok) throw await responseError(summary, '首章 5W1H 请求失败');
 const data = await summary.json();
 for (const key of ['who', 'what', 'when', 'where', 'why', 'how']) {
   assert.ok(typeof data[key] === 'string' && data[key].trim(), 'Missing 5W1H field: ' + key);
