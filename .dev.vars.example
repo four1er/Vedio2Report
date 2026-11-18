@@ -1,0 +1,2 @@
+# Copy to .dev.vars for local development. Make your own key in Google AI Studio.
+GEMINI_API_KEY=

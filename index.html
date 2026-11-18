@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f8f7f2" />
+    <meta name="description" content="用声稿把有字幕的 YouTube 视频整理成中文文章，逐章阅读并展开 5W1H 总结。" />
+    <title>声稿 · 视频对话写作台</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23ad462d'/%3E%3Cpath d='M9 17h4v9H9zm6-7h4v20h-4zm6 4h4v15h-4zm6 4h4v7h-4z' fill='white'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <a class="skip" href="#studio">跳到写作台</a>
+    <header class="masthead">
+      <div class="shell mast-inner">
+        <a class="brand" href="#" aria-label="声稿首页">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>声稿</span><span class="brand-en" lang="en">Dialogue Press</span>
+        </a>
+        <nav aria-label="主导航">
+          <a href="#studio" id="nav-studio" class="nav-item selected">写作台</a>
+          <a href="#article" id="nav-sample" class="nav-item">示例文章</a>
+          <a class="repo" href="https://github.com/four1er/Vedio2Report" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看项目"><span data-icon="github"></span><span>GitHub</span><span data-icon="arrow-up-right"></span></a>
+        </nav>
+      </div>
+    </header>
+    <main class="shell">
+      <section class="intro" aria-labelledby="intro-title">
+        <div class="intro-copy">
+          <p class="eyebrow"><span class="short-rule"></span>视频对话写作台</p>
+          <h1 id="intro-title">把视频对话，<br />读成<span>一篇文章。</span></h1>
+          <p class="intro-description">从 YouTube 字幕出发，用 Gemini 写成有章节、有脉络的中文长文。</p>
+        </div>
+        <img class="hero-art" src="/editorial-art.webp" alt="" width="544" height="320" fetchpriority="high" />
+      </section>
+      <div class="workspace" id="studio">
+        <section class="editor panel" aria-labelledby="editor-title">
+          <div class="card-heading">
+            <div class="heading-group"><span class="heading-icon" data-icon="pen"></span><h2 id="editor-title">生成新文章</h2></div>
+            <span class="engine" lang="en"><span data-icon="sparkles"></span>Gemini</span>
+          </div>
+          <form id="generate">
+            <div class="label-row">
+              <label for="video">YouTube 视频链接</label>
+              <button id="fill" class="text-button" type="button">填入示例链接<span data-icon="corner"></span></button>
+            </div>
+            <div class="input-wrap"><span data-icon="link"></span><input id="video" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" required autocomplete="url" aria-describedby="url-hint" maxlength="2048" /></div>
+            <p class="hint" id="url-hint">支持带字幕的公开视频。</p>
+            <div class="label-row prompt-label"><label for="requirements">写作要求<span class="optional">选填</span></label></div>
+            <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如：写给产品经理，用访谈风格，保留关键数据，分三章展开。"></textarea>
+            <div class="form-actions"><button type="submit" class="primary" id="submit"><span data-icon="pen"></span><span id="submit-caption">开始生成</span><span data-icon="arrow"></span></button><button type="button" id="stop" class="subtle" hidden>停止生成</button></div>
+            <p id="feedback" role="alert" hidden></p>
+          </form>
+        </section>
+        <aside class="sample-card panel" aria-labelledby="sample-title">
+          <div class="cover" aria-hidden="true">
+            <span class="cover-word">AI</span>
+            <span class="record"><i></i></span>
+            <span class="wave"></span>
+          </div>
+          <div class="sample-copy">
+            <p class="eyebrow"><span class="small-dot"></span>示例文章</p>
+            <h2 id="sample-title">对话安德森：<span class="subject">AI 革命</span>的万亿美金之问</h2>
+            <p class="sample-description">从智能经济到商业模式，试读分章文章与 5W1H 总结。</p>
+            <button id="sample" class="read-button" type="button"><span data-icon="book"></span>阅读示例<span data-icon="arrow"></span></button>
+          </div>
+        </aside>
+      </div>
+      <section id="article" class="reader panel" hidden aria-labelledby="reader-title">
+        <div class="reader-bar"><p class="eyebrow"><span class="small-dot"></span><span id="reader-mode"></span></p><button id="copy" class="text-button" type="button" hidden><span data-icon="copy"></span><span id="copy-label">复制正文</span></button></div>
+        <h2 id="reader-title" tabindex="-1">生成结果</h2>
+        <p class="reader-source" id="reader-source"></p>
+        <p class="reader-status" id="reader-status" role="status"></p>
+        <div id="body" class="prose"></div>
+      </section>
+    </main>
+    <footer class="shell"><span>声稿 <em lang="en">Dialogue Press</em></span><span>由 Gemini 提供生成能力</span></footer>
+    <script type="module" src="/src/web/main.ts"></script>
+  </body>
+</html>
