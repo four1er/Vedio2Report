@@ -18,7 +18,7 @@
         </a>
         <nav aria-label="主导航">
           <a href="#studio" id="nav-studio" class="nav-item selected">写作台</a>
-          <a href="#article" id="nav-sample" class="nav-item">示例文章</a>
+          <a href="#article" id="nav-sample" class="nav-item">排版样稿</a>
           <a class="repo" href="https://github.com/four1er/Vedio2Report" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看项目"><span data-icon="github"></span><span>GitHub</span><span data-icon="arrow-up-right"></span></a>
         </nav>
       </div>
@@ -58,10 +58,10 @@
             <span class="wave"></span>
           </div>
           <div class="sample-copy">
-            <p class="eyebrow"><span class="small-dot"></span>示例文章</p>
+            <p class="eyebrow"><span class="small-dot"></span>排版样稿</p>
             <h2 id="sample-title">谁会为 <span class="subject">AI 付费</span>？</h2>
-            <p class="sample-description">原创排版示例，体验分章阅读与 5W1H 总结。</p>
-            <button id="sample" class="read-button" type="button"><span data-icon="book"></span>阅读示例<span data-icon="arrow"></span></button>
+            <p class="sample-description">两章预置样稿，可体验章节小结和 5W1H。</p>
+            <button id="sample" class="read-button" type="button"><span data-icon="book"></span>阅读样稿<span data-icon="arrow"></span></button>
           </div>
         </aside>
       </div>
@@ -69,6 +69,10 @@
         <div class="reader-bar"><p class="eyebrow"><span class="small-dot"></span><span id="reader-mode"></span></p><button type="button" id="stop" class="subtle" hidden>停止生成</button><button id="copy" class="text-button" type="button" hidden><span data-icon="copy"></span><span id="copy-label">复制正文</span></button></div>
         <h2 id="reader-title" tabindex="-1">生成结果</h2>
         <p class="reader-source" id="reader-source"></p>
+        <details class="reader-timeline" id="reader-timeline" hidden>
+          <summary>原片时间线</summary>
+          <ol id="timeline-topics"></ol>
+        </details>
         <p class="reader-status" id="reader-status" role="status"></p>
         <div id="body" class="prose"></div>
       </section>

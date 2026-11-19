@@ -103,6 +103,16 @@ textarea {resize:vertical;min-height:76px;display:block;line-height:1.65}
 .reader-bar {justify-content:space-between;min-height:30px;margin-bottom:16px}
 .reader h2 {font-size:clamp(29px,4vw,43px);line-height:1.45}
 .reader-source,.reader-status {font-size:13px;color:var(--muted);margin:10px 0}
+.reader-source a,.reader-timeline a:hover,.chapter-time:hover {text-decoration:underline}
+.reader-timeline {font-size:14px;margin:12px 0;color:var(--muted)}
+.reader-timeline summary {cursor:pointer;color:var(--rust);width:fit-content}
+.reader-timeline ol {list-style:none;margin:10px 0;padding:0}
+.reader-timeline a {display:flex;align-items:baseline;gap:12px;padding:4px 0;color:var(--ink)}
+.reader-timeline time,.chapter-time {font:600 13px/1.5 system-ui,sans-serif;font-variant-numeric:tabular-nums;color:var(--rust)}
+.reader-timeline time {min-width:4.5em}
+.chapter-time {vertical-align:middle;margin-right:4px}
+.prose .chapter-recap {border-left:3px solid var(--rust);padding:7px 14px;background:#f5f2e9}
+.chapter-recap > strong:first-child {color:var(--rust)}
 .reader-status:empty {display:none}
 .prose {font-family:var(--serif);font-size:17px;line-height:1.95;overflow-wrap:anywhere}
 .prose p {margin:1em 0}

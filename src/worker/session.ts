@@ -1,6 +1,6 @@
 import { getVideoSource, type Video } from './captions'
 import { summarize, writeArticle } from './gemini'
-import { ApiError, extractChapters, failure, json } from './protocol'
+import { ApiError, chapterHeadings, extractChapters, failure, json, requireChapterRecap } from './protocol'
 import type { Bindings, Chapter, Summary } from './protocol'
 
 const lifetime = 24 * 60 * 60 * 1000
@@ -51,25 +51,60 @@ export class ArticleSession {
   }
 
   private async *generate(video: Video, requirements: string, signal: AbortSignal): AsyncGenerator<StreamEvent> {
-    yield ['meta', {articleId: this.state.id.toString(), videoId: video.videoId, source: video.source, title: video.title}]
+    yield ['meta', {
+      articleId: this.state.id.toString(), videoId: video.videoId, source: video.source, title: video.title,
+      durationSeconds: video.durationSeconds, lastCaptionSeconds: video.lastCaptionSeconds, cueCount: video.cueCount,
+      timeline: video.timeline?.map(({at, topic}) => ({at, topic})),
+    }]
+    const expiresAt = Date.now() + lifetime
+    await this.state.storage.setAlarm(expiresAt)
+    await this.state.storage.put({session: {expiresAt, requirements}, video})
+
     let article = ''
+    let nextLine = 0
+    let headingsSeen = 0
+    let published = 0
+    const checkpoint = async (prefix: string) => {
+      const chapter = extractChapters(prefix).at(-1)!
+      requireChapterRecap(chapter)
+      await this.state.storage.put('article', prefix)
+      published++
+      return {id: chapter.id, title: chapter.title}
+    }
     for await (const text of writeArticle(this.env, {video, requirements}, signal)) {
+      // A separate, successfully finished topic request has a confirmed boundary
+      // even when the next upstream request has not produced a heading yet.
+      if (typeof text !== 'string') {
+        yield ['chapter', await checkpoint(article)]
+        continue
+      }
       article += text
       if (article.length > 100_000) throw new ApiError(502, '生成文章过长，请缩小范围。')
       yield ['delta', {text}]
+      // A heading can be split across deltas. Only examine lines whose newline
+      // has arrived, retaining the unfinished line's starting offset.
+      const newline = text.lastIndexOf('\n')
+      if (newline < 0) continue
+      const end = article.length - text.length + newline + 1
+      for (const heading of chapterHeadings(article.slice(nextLine, end))) {
+        if (headingsSeen++ <= published) continue
+        const prefix = article.slice(0, nextLine + heading.index)
+        yield ['chapter', await checkpoint(prefix)]
+      }
+      nextLine = end
     }
     const chapters = extractChapters(article)
-    const expiresAt = Date.now() + lifetime
-    await this.state.storage.setAlarm(expiresAt)
-    // Separate values keep each field below Durable Object storage value limits.
-    await this.state.storage.put({session: {expiresAt, requirements}, video, article})
+    const remaining = chapters.slice(published)
+    for (const chapter of remaining) requireChapterRecap(chapter)
+    if (remaining.length) await this.state.storage.put('article', article)
+    for (const {id, title} of remaining) yield ['chapter', {id, title}]
     yield ['done', {chapters: chapters.map(({id, title}) => ({id, title}))}]
   }
 
   private async getSummary(id: string): Promise<Summary> {
     // Check expiry even when a scheduled alarm is delivered late.
     const session = await this.state.storage.get<Session>('session')
-    if (!session || session.expiresAt <= Date.now()) throw new ApiError(404, '文章还未完成或已过期，请重新生成。')
+    if (!session || session.expiresAt <= Date.now()) throw new ApiError(404, '未找到文章或文章已过期，请重新生成。')
     const cached = await this.state.storage.get<Summary>('summary/' + id)
     if (cached) return cached
     const running = this.pending.get(id)
@@ -83,9 +118,10 @@ export class ArticleSession {
     const [video, article] = await Promise.all([
       this.state.storage.get<Video>('video'), this.state.storage.get<string>('article'),
     ])
-    if (!video || !article) throw new ApiError(404, '文章上下文已失效。')
+    if (!video) throw new ApiError(404, '文章上下文已失效。')
+    if (!article) throw new ApiError(404, '该章节尚未写完或不存在。')
     const chapter: Chapter | undefined = extractChapters(article).find(item => item.id === id)
-    if (!chapter) throw new ApiError(404, '未找到该章节。')
+    if (!chapter) throw new ApiError(404, '该章节尚未写完或不存在。')
     // Sessions from the former video-input path stored an ID without caption text.
     const context = video.text ? video : {...await getVideoSource(video.videoId), videoId: video.videoId}
     const result = await summarize(this.env, context, article, chapter, AbortSignal.timeout(90_000))

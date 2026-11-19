@@ -1,3 +1,5 @@
+import { chapterRecapText } from '../shared/chapter-recap'
+
 export type Summary = Record<'who' | 'what' | 'when' | 'where' | 'why' | 'how', string>
 export const dimensions = ['who', 'what', 'when', 'where', 'why', 'how'] as const
 
@@ -69,8 +71,20 @@ export async function requireEmptyBody(request: Request): Promise<void> {
 
 export interface Chapter {id: string; title: string; text: string}
 
+// Check new output at publication time. Stored articles from previous versions
+// may predate chapter recaps and can still be used for on-demand summaries.
+export function requireChapterRecap(chapter: Chapter): void {
+  const lastBreak = chapter.text.lastIndexOf('\n')
+  if (lastBreak < 0 || !chapterRecapText(chapter.text.slice(lastBreak + 1)))
+    throw new ApiError(502, '“' + chapter.title + '”缺少完整的正文或章末小结，请重新生成。')
+}
+
+export function chapterHeadings(text: string) {
+  return text.matchAll(/^##[ \t]+(\S[^\r\n]*)\r?$/gm)
+}
+
 export function extractChapters(article: string): Chapter[] {
-  const headings = Array.from(article.matchAll(/^##[ \t]+(\S[^\n]*)$/gm))
+  const headings = Array.from(chapterHeadings(article))
   const titleCount = article.match(/^#[ \t]+\S/gm)?.length
   if (!article.trimStart().startsWith('# ') || titleCount !== 1 || headings.length === 0)
     throw new ApiError(502, '模型未生成完整的章节结构，请重新生成。')

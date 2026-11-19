@@ -7,7 +7,16 @@ const youtubeHosts = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]
 const invalidLink = "请输入有效的 YouTube 视频链接，例如 youtube.com/watch?v=… 或 youtu.be/…。";
 const unavailable = "YouTube 暂时没有返回可读取的字幕。请确认视频公开且有字幕，或尝试示例链接。";
 
-type Source = {source: "youtube" | "cached" | "archived-youtube"; title: string; text: string};
+interface CaptionMark {at: string; firstCue: number; topic?: string}
+interface Source {
+  source: "youtube" | "cached" | "archived-youtube";
+  title: string;
+  text: string;
+  durationSeconds?: number;
+  lastCaptionSeconds?: number;
+  cueCount?: number;
+  timeline?: CaptionMark[];
+}
 export type Video = Source & {videoId: string};
 
 export function parseVideoId(input: string): string {
@@ -37,7 +46,7 @@ interface CaptionTrack {
   kind?: string;
 }
 interface Player {
-  videoDetails?: {videoId?: string; title?: string};
+  videoDetails?: {videoId?: string; title?: string; lengthSeconds?: string};
   captions?: {playerCaptionsTracklistRenderer?: {captionTracks?: CaptionTrack[]}};
 }
 
@@ -87,6 +96,17 @@ function rank(track: CaptionTrack): number {
   return (track.kind === "asr" ? 4 : 0) + (lang === "zh" ? 0 : lang === "en" ? 1 : 2);
 }
 
+function clockTime(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds / 60) % 60;
+  const remainder = String(seconds % 60).padStart(2, "0");
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${remainder}` : `${minutes}:${remainder}`;
+}
+
+function validMs(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 async function liveCaptions(videoId: string): Promise<Source> {
   const signal = AbortSignal.timeout(10000);
   const html = await readLimited(`https://www.youtube.com/watch?v=${videoId}&hl=en`, 5_000_000, signal);
@@ -102,20 +122,42 @@ async function liveCaptions(videoId: string): Promise<Source> {
       trackUrl.searchParams.get("v") !== videoId) throw new Error(unavailable);
   trackUrl.searchParams.set("fmt", "json3");
   const payload = JSON.parse(await readLimited(trackUrl, 5_000_000, signal)) as {
-    events?: Array<{segs?: Array<{utf8?: string}>}>;
+    events?: Array<{tStartMs?: number; dDurationMs?: number; segs?: Array<{utf8?: string}>}>;
   };
-  const lines = (payload.events ?? []).map(event => event.segs?.map(s => s.utf8 ?? "").join("")
-      .replace(/\s+/g, " ").trim()).filter(Boolean);
-  const text = lines.join("\n");
+  const cues = (payload.events ?? []).map(event => ({
+    text: event.segs?.map(s => s.utf8 ?? "").join("").replace(/\s+/g, " ").trim(),
+    start: event.tStartMs, duration: event.dDurationMs,
+  })).filter(cue => cue.text);
+  const text = cues.map(cue => cue.text).join("\n");
   if (!text) throw new Error(unavailable);
   if (new TextEncoder().encode(text).byteLength > 100_000) throw new Error("字幕过长，请选择字幕在 100 KB 以内的视频。");
-  return {text, title: player.videoDetails?.title || "YouTube 视频", source: "youtube"};
+  const result: Source = {text, title: player.videoDetails?.title || "YouTube 视频", source: "youtube", cueCount: cues.length};
+  const length = Number(player.videoDetails?.lengthSeconds);
+  if (Number.isSafeInteger(length) && length > 0) result.durationSeconds = length;
+  const last = cues[cues.length - 1];
+  if (validMs(last.start) && validMs(last.duration)) {
+    const end = Math.floor((last.start + last.duration) / 1000);
+    if (result.durationSeconds === undefined || end <= result.durationSeconds) result.lastCaptionSeconds = end;
+  }
+  // Bound the metadata even for unusually long or discontinuous caption tracks.
+  const latestMs = cues.reduce((latest, cue) => validMs(cue.start) ? Math.max(latest, cue.start) : latest, 0);
+  const spacing = Math.max(300_000, Math.ceil(latestMs / 32));
+  const marks: CaptionMark[] = [];
+  let nextMs = 0;
+  for (const [i, cue] of cues.entries()) {
+    if (validMs(cue.start) && cue.start >= nextMs) {
+      marks.push({at: clockTime(Math.floor(cue.start / 1000)), firstCue: i + 1});
+      nextMs = cue.start + spacing;
+    }
+  }
+  if (marks.length) result.timeline = marks;
+  return result;
 }
 
 export async function getVideoSource(videoId: string): Promise<Source> {
   if (!videoIdPattern.test(videoId)) throw new Error(invalidLink);
   if (videoId === interview.videoId) {
-    return {source: "archived-youtube", title: interview.title, text: interview.text};
+    return {...interview, source: "archived-youtube"};
   }
   try {
     return await liveCaptions(videoId);

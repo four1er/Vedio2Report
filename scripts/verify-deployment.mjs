@@ -23,6 +23,8 @@ console.log('Public Worker:', origin);
 
 const interviewId = 'xRh2sVcNXQ8';
 const videoId = process.env.ACCEPTANCE_VIDEO_ID || interviewId;
+const fullInterview = process.argv.includes('--full');
+if (fullInterview) assert.equal(videoId, interviewId, 'Full coverage check uses the reference interview');
 assert.match(videoId, /^[A-Za-z0-9_-]{11}$/);
 
 // Measure rendered prose in the viewport. A title, status change, or SSE frame
@@ -99,7 +101,7 @@ try {
     await page.locator('#video').fill(url);
   }
   const scope = videoId === interviewId ? '只讨论受访者对 AI 产品定价的看法。' : '只讨论字幕中最主要的话题。';
-  const requirements = '写给刚入行的产品经理。' + scope + '写成两章中文问答，每章约两百字，先提出一个读者的问题，再回答这个问题。';
+  const requirements = fullInterview ? '' : '写给刚入行的产品经理。' + scope + '写成两章中文问答，每章约两百字，先提出一个读者的问题，再回答这个问题。';
   await page.locator('#requirements').fill(requirements);
   await page.evaluate(observeReading);
   const api = origin + '/api/articles';
@@ -113,7 +115,27 @@ try {
   ]);
   assert.equal(article.request().postDataJSON().requirements, requirements);
   assert.equal(article.status(), 200, 'Article request failed');
-  await page.waitForFunction(() => !document.querySelector('#submit').disabled, null, {timeout: 210000});
+  const buttons = page.locator('.chapter-head > .summary-toggle');
+  await page.waitForFunction(() =>
+    document.querySelector('.chapter-head > .summary-toggle') || !document.querySelector('#submit').disabled,
+    null, {timeout: 210000});
+  if (!await buttons.count()) {
+    const status = await page.locator('#reader-status').textContent();
+    const feedback = await page.locator('#feedback').textContent();
+    assert.fail('No chapter became available. ' + [status, feedback].filter(Boolean).join(' '));
+  }
+  assert.equal(summaryRequests.length, 0, 'A section recap must not trigger a separate summary request');
+  await page.locator('.chapter-recap').first().waitFor();
+  const firstReadyMs = await page.evaluate(() => {
+    if (!document.querySelector('#submit').disabled) throw new Error('First chapter only became usable after completion');
+    return Math.round(performance.now() - window.submittedAt);
+  });
+  const [summary] = await Promise.all([
+    page.waitForResponse(res => res.url().endsWith('/summary'), {timeout: 105000}),
+    buttons.first().click(),
+  ]);
+  await page.waitForFunction(() => !document.querySelector('#submit').disabled, null,
+    {timeout: fullInterview ? 600000 : 210000});
   assert.match(await page.locator('#reader-status').innerText(), /生成完成/, await page.locator('#feedback').textContent());
 
   const {partial, durationMs} = await page.evaluate(api => {
@@ -129,38 +151,58 @@ try {
     'Expected growing paragraph text inside the viewport on separate frames before the HTTP response ended');
 
   let meta, chapters, deltas = 0;
+  const closedChapters = [];
   const stream = new Response(await page.evaluate(() => window.articleEvents), {headers: article.headers()});
   for await (const {type, data} of events(stream)) {
     if (type === 'meta') meta = data;
     if (type === 'delta') deltas++;
+    if (type === 'chapter') closedChapters.push(data);
     if (type === 'done') chapters = data.chapters;
   }
   assert.equal(meta.videoId, videoId);
   assert.match(meta.articleId, /^[a-f0-9]{64}$/);
-  if (videoId === interviewId) assert.equal(meta.source, 'archived-youtube');
-  else assert.ok(meta.source === 'youtube' || (videoId === 'C4GIqWeywiI' && meta.source === 'cached'));
+  if (videoId === interviewId) {
+    assert.equal(meta.source, 'archived-youtube');
+    assert.equal(meta.durationSeconds, 4878);
+    assert.equal(meta.lastCaptionSeconds, 4866);
+    assert.equal(meta.cueCount, 2801);
+    assert.equal(meta.timeline.length, 12);
+  } else assert.ok(meta.source === 'youtube' || (videoId === 'C4GIqWeywiI' && meta.source === 'cached'));
   assert.ok(deltas >= 2);
-  assert.equal(chapters.length, 2, 'Requested two chapters');
-  const prose = await page.locator('#body').innerText();
-  if (videoId === interviewId) assert.match(prose, /定价|计价|收费/);
+  assert.deepEqual(closedChapters, chapters, 'Each chapter should be announced when sealed');
+  assert.equal(await page.locator('.chapter-recap').count(), chapters.length, 'Missing automatic chapter recap');
+  if (!fullInterview) assert.equal(chapters.length, 2, 'Requested two chapters');
   const sections = await page.locator('.chapter-head').evaluateAll(headings => headings.map(heading => {
     let text = heading.querySelector('h3').innerText + '\n';
     for (let node = heading.nextElementSibling; node && !node.classList.contains('chapter-head'); node = node.nextElementSibling) {
-      if (!node.hidden) text += node.innerText + '\n';
+      if (!node.hidden && !node.classList.contains('summary-box')) text += node.innerText + '\n';
     }
     return text;
   }));
-  for (const text of sections) {
-    assert.match(text, /[？?][\s\S]*\p{Script=Han}[\s\S]{30}/u, 'Expected a question followed by an answer in each chapter');
+  if (fullInterview) {
+    console.log('全场章节', chapters.map(chapter => chapter.title).join(' / '));
+    const timestamps = await page.locator('.chapter-head a.chapter-time').evaluateAll(links =>
+      links.map(link => Number(new URL(link.href).searchParams.get('t')?.replace(/s$/, ''))));
+    const publisherStarts = meta.timeline.map(mark =>
+      mark.at.split(':').reduce((total, part) => total * 60 + Number(part), 0));
+    assert.deepEqual(timestamps, publisherStarts, 'Expected every publisher topic, in chronological order');
+    assert.match(sections.slice(-3).join(' '), /就业|工作|劳动|火星|快问快答|快速问答/, 'Expected a topic from the last quarter');
+  } else {
+    for (const text of sections) {
+      assert.match(text, /[？?][\s\S]*\p{Script=Han}[\s\S]{30}/u, 'Expected a question followed by an answer in each chapter');
+      if (videoId === interviewId) assert.match(text, /定价|计价|收费|价格/);
+    }
   }
-  const buttons = page.locator('.chapter-head > .summary-toggle');
   assert.equal(await buttons.count(), chapters.length);
-  assert.equal(summaryRequests.length, 0, 'Summary must be generated on demand');
+  assert.equal(summaryRequests.length, 1, 'Expected one summary request for the one user click');
   const path = api + '/' + meta.articleId + '/chapters/' + chapters[0].id + '/summary';
-  const [summary] = await Promise.all([
-    page.waitForResponse(res => res.url() === path, {timeout: 105000}),
-    buttons.first().click(),
-  ]);
+  assert.equal(summary.url(), path);
+  await summary.finished();
+  const clickedBeforeEnd = await page.evaluate(({api, path}) => {
+    const summaryStart = performance.getEntriesByName(path).at(-1)?.startTime;
+    return summaryStart < performance.getEntriesByName(api).at(-1)?.responseEnd;
+  }, {api, path});
+  assert.ok(clickedBeforeEnd, 'First chapter 5W1H request must start before the article stream ends');
   assert.equal(summary.status(), 200, '5W1H HTTP status');
   assert.equal(summary.request().method(), 'POST');
   assert.equal(summary.request().postData(), null);
@@ -175,7 +217,7 @@ try {
     assert.equal(await box.locator('dd').nth(i).textContent(), field);
   }
   for (const key of ['what', 'why', 'how']) assert.match(data[key], /\p{Script=Han}/u);
-  const evidence = `视频 ${videoId}，来源 ${meta.source}，首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长。全文 ${durationMs} ms，${deltas} 个增量事件，两章问答及首章 5W1H 验收通过。`;
+  const evidence = `视频 ${videoId}，来源 ${meta.source}，首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章。首章小结和 5W1H 在 ${firstReadyMs} ms 可用，首章总结在后续章节生成期间已发起。`;
   console.log(evidence);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY,
     `[打开已验证的公开 Worker](${origin})\n\n${evidence}\n`);
