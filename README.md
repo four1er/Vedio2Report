@@ -1,92 +1,142 @@
 # 声稿 · Dialogue Press
 
-粘贴一个有可读字幕的 YouTube 视频链接，写作台会把整场内容整理成可边生成边阅读的中文文章。访谈按话题分章，保留提问和第一人称回答。同一回答里，判断、依据和例子可以依次成段。读者在一个议题下读完这轮问答，转入另一项独立讨论时才需要新的小标题。讲座沿用讲者的论证顺序，教程保留操作和条件。每个章节写完后，后台就准备该章的 **5W1H**，点标题旁的按钮即可展开。[在线写作台](https://vedio2report.tf08202000.workers.dev) · [任务要求与验收记录](tasks/youtube-to-article.md)
+输入任意公开且带字幕的 YouTube 视频链接，实时流式生成排版清晰的中文深度对话文章，支持自然语言写作要求约束与章节级 **5W1H** 结构化总结。
 
-写作要求留空即可生成整理稿。Gemini 可以删去口头禅、无信息的附和和同一句的反复起头，把同一人讲同一件事的几条字幕连成自然段。同一论点用了几个相似例子时，可以保留最能说明问题的一个。数字与单位、独立理由、反例、否定及「可能」「大概」等影响意思的措辞要保留。想看更贴近原话的版本，可填写「逐字转写」。首页的安德森节选用于对照排版，其他视频使用各自的字幕。[数学短片](https://youtu.be/U3O1nzSojnc) · [访谈参考稿](https://msgeanzs2xvq.sg.larksuite.com/docx/IfDxduc1HoUr3Gx81Bul14CLgog)
+- **在线演示**：[https://vedio2report.tf08202000.workers.dev](https://vedio2report.tf08202000.workers.dev)
+- **技术栈**：TypeScript · Vite（前端零框架原生 DOM）· Cloudflare Workers · Durable Objects（SQLite）· Gemini AI Studio API
+
+---
+
+## 模块结构
+
+```text
+src/
+├── shared/types.ts          # 前后端共享协议类型（5W1H、四维度约束、SSE 元信息）
+├── worker/
+│   ├── index.ts             # HTTP 路由、同源校验、限流与 Durable Object 调度
+│   ├── protocol.ts          # 错误封装、JSON/空请求体校验、章节边界解析
+│   ├── tls13.ts             # 基于原生 WebCrypto 的纯 TS TLS 1.3 客户端（RFC 8446）
+│   ├── proxy-http.ts        # Cloudflare TCP Socket + HTTP CONNECT 代理客户端与代理池解析
+│   ├── captions.ts          # YouTube 字幕解析（Android Innertube + Watch Page + 硬编码兜底）
+│   ├── caption-cache.ts     # CaptionCache Durable Object（24h 字幕缓存 + 并发去重）
+│   ├── gemini.ts            # Gemini 调用：4D 意图解析 / 全局流式正文 / 章节 5W1H JSON
+│   ├── session.ts           # ArticleSession Durable Object（上下文持久化 + 按需 5W1H 缓存）
+│   └── archives/            # 构建期校验并准备的示例视频兜底字幕（xRh2sVcNXQ8）
+└── web/
+    ├── main.ts              # 表单交互、快捷要求预设、SSE 流式消费与约束标签渲染
+    ├── reader.ts            # 纯 DOM 增量 Markdown 渲染器、动态章节目录与 5W1H 面板
+    ├── stream.ts            # 浏览器端 SSE 解析器
+    ├── sample.ts            # 参考排版样稿与 5W1H 示例
+    └── style.css            # 编辑部暖纸排版样式
+```
+
+---
 
 ## 1. 如何获取和处理 YouTube 字幕
 
-点击「开始生成」后，网页先通过 `POST /api/captions` 提交链接。服务端解析单个视频 ID，支持观看页、短链、Shorts、直播回放和嵌入链接。同一视频的并发请求共用一个下载任务。网页收到 HTTP 202 时显示下载状态，通过 `GET /api/captions/{videoId}` 查询。服务端确认已保存完整、非空字幕后，网页才提交文章请求。[字幕检查](src/worker/captions.ts) · [下载任务与缓存](src/worker/caption-cache.ts)
+核心实现见 [`src/worker/captions.ts`](src/worker/captions.ts)、[`src/worker/proxy-http.ts`](src/worker/proxy-http.ts)、[`src/worker/tls13.ts`](src/worker/tls13.ts) 与 [`src/worker/caption-cache.ts`](src/worker/caption-cache.ts)。
 
-| 字幕来源 | 何时使用及如何核对 |
-| --- | --- |
-| YouTube 字幕轨 | 普通视频优先读取公开播放页，核对播放器视频 ID，按人工字幕优先、语言偏好选择轨道。读取 JSON3，合并每条的文字片段、清理空白、保留时间。首选轨为空时继续检查同片其他有效轨道。 |
-| 发布者公开字幕 | 碰到流量验证或临时读取故障时，按同一视频 ID 检索发布者目录。目前收录 143 个有英文 SRT 的 3Blue1Brown 视频。目录仅含 ID、标题和路径，下载任务核对发布者的 `video_url.txt` 后读取对应 SRT。页面给出原字幕链接。[发布者字幕库](https://github.com/3b1b/captions/tree/9aef876b0ed62ce4f099c0a2f0e7a52e8d1058c9) · [来源核对](src/worker/published-captions.ts) |
-| 可选通用字幕服务 | 配置服务端 Secret `SUPADATA_API_KEY` 后，普通链接在直接读取失败且没有对应发布者记录时，也可通过 Supadata 查询同片现有字幕。请求指定 `mode=native`，异步响应按返回的任务 ID 查询，费用取决于供应商套餐。截至 2026 年 11 月 20 日，本仓库的公开部署尚未配置该密钥。[官方接口](https://docs.supadata.ai/get-transcript) · [实现](src/worker/native-captions.ts) |
-| 固定演示存档 | 安德森访谈按精确 ID 使用打包字幕，W3C 无障碍短片在线获取失败时使用该片的官方文字稿。两份存档仅匹配各自的原片。[安德森访谈](https://youtu.be/xRh2sVcNXQ8) · [W3C 官方文字稿](https://www.w3.org/WAI/test-evaluate/#transcript) |
+1. **解决 Cloudflare Worker 访问 YouTube 验证码问题（TCP Socket + 代理池 + WebCrypto TLS 1.3）**：
+   - Cloudflare Worker 的标准 `fetch()` 无法配置 HTTP 代理，直连 YouTube 常在数据中心 IP 上触发 `/sorry` 验证码或 `LOGIN_REQUIRED`。
+   - 本项目通过环境变量 `PROXY_LIST` 接入 **webshare.io** 免费代理列表（兼容 `IP:PORT:USER:PASS` 与 `http://user:pass@host:port` 格式），每次请求随机轮换最多 3 个代理节点，通过 Cloudflare Workers 原生 **TCP Socket（`cloudflare:sockets` `connect()`）** 建立 `HTTP CONNECT` 隧道并附带 `Proxy-Authorization` 鉴权。
+   - **生产级细节处理**：Cloudflare 边缘节点当前存在已知缺陷（`cloudflare/workerd#6903`），对 IP 连接调用 `socket.startTls({ expectedServerHostname })` 时会遗漏 TLS SNI，导致 HTTPS 代理隧道在本地 `wrangler dev` 正常但线上握手失败。为此，[`tls13.ts`](src/worker/tls13.ts) 基于 Workers 原生硬件加速的 `crypto.subtle`（ECDH P-256 + HKDF + AES-GCM）实现了零依赖的 **RFC 8446 TLS 1.3 客户端**，完整发送 `server_name`（SNI）扩展、校验服务端证书 SAN 主机名与 `CertificateVerify` 签名及 `Finished` MAC，在生产边缘稳定运行且 CPU 开销低于 1 ms。
+2. **双路径提取与格式兼容**：
+   - **主路径（轻量快速）**：优先依次调用 YouTube Android / iOS Innertube 接口（`POST /youtubei/v1/player`），体积极小且避免 Web 端 `timedtext` 需要 PO Token 返回空正文的问题；同时从 `shortDescription` 提取发布者时间轴章节提示。
+   - **降级路径**：若无 Key 的 Innertube 被拦截或未返回轨道，自动回退拉取 Watch 页面提取 `INNERTUBE_API_KEY` 与 `ytInitialPlayerResponse`。
+   - **字幕解析**：按「人工字幕优先、中文 > 英文 > 其他」择优选择轨道，优先解析 `json3`，空返回时自动降级解析 XML（`<text>` / `<p>`）并解码 HTML 实体，每 30 秒插入时间戳锚点并限制 512 KB 上限。
+3. **缓存与兜底策略**：
+   - 使用 [`CaptionCache`](src/worker/caption-cache.ts) Durable Object 按 `videoId` 缓存字幕 24 小时并对并发请求去重。
+   - 若所有代理与直连均失败，针对示例视频 `xRh2sVcNXQ8` 自动降级使用内置校验字幕存档，保证演示零失败；若播放器确认视频本身无字幕轨，则直接返回 HTTP `422 NO_CAPTIONS`，不浪费 Gemini 额度。
 
-已下载的字幕按视频 ID 缓存 24 小时。播放器明确确认无公开字幕轨时返回 `NO_CAPTIONS`。遇到验证码且各可用来源都无法提供同片字幕时，页面提示暂时无法确认。登录受限和临时网络故障也有相应提示。字幕准备失败时生成流程即结束。[字幕解析与大小限制](src/worker/caption-source.ts)
-
-安德森演示存档记录了原片时长 **1:21:18**、2,801 条英文字幕及末条终点 **1:21:06**。`npm ci` 从固定版本下载并校验文件摘要、视频 ID、条数和首尾时间，再将发布者的 12 个话题与字幕位置对齐。W3C 文字稿来自 W3C Web Accessibility Initiative (WAI), Education and Outreach Working Group，授权为 CC BY 4.0，仅收录口述内容。[存档准备脚本](scripts/prepare-captions.mjs) · [W3C 授权](https://creativecommons.org/licenses/by/4.0/)
+---
 
 ## 2. 如何调用 Gemini 并实现流式输出
 
-服务端先为连续的字幕片段分配顺序编号，保留每段原文和起止字幕行。带发布者目录的长片可沿用原章节和跳转时间。时间点落在发言中间时，正文就近从换人处或句子开头分章。普通长片使用可靠的字幕时间锚点，无时间码的长文字稿按连续材料分章。主文章每次向 Gemini 提交一批字幕文本，以及衔接当前发言所需的前文。[字幕分段](src/worker/transcript-plan.ts)
+核心实现见 [`src/worker/gemini.ts`](src/worker/gemini.ts)、[`src/worker/session.ts`](src/worker/session.ts) 与 [`src/web/reader.ts`](src/web/reader.ts)。
 
-Worker 调用 Gemini 的 `streamGenerateContent?alt=sse`，默认模型为 `gemini-3.1-flash-lite`，可用服务端变量 `GEMINI_MODEL` 更换。在默认整理模式，模型可将几段相邻字幕整理为一条带来源编号范围的记录。收到完整记录后，服务端校验其范围和次序，用 `delta` 事件把成稿段落发给浏览器。纯填充语可以只推进字幕处理进度。读者在后续批次生成期间，就能读到已经写好的问答。[生成与续写](src/worker/gemini.ts) · [整理规则](src/worker/edited-response.ts) · [浏览器渲染](src/web/main.ts)
+- **单次全局上下文流式生成**：1 小时 20 分钟访谈的完整字幕仅约 2~3 万输入 token，远低于 Gemini 1M 上下文窗口；参考成稿约 8,400 字，亦远低于模型单次输出上限。因此直接将全片字幕与时间锚点一次传入 Gemini `streamGenerateContent?alt=sse`（默认模型 `gemini-3.1-flash-lite`，可通过 `GEMINI_MODEL` 覆盖），既保证了全片宏观分章质量，又将首字延迟压缩到 1~2 秒。
+- **端到端 SSE 实时推送与可视化指标**：Worker 解析上游 SSE 帧后立即以 `event: delta` 转发至浏览器；前端通过 `requestAnimationFrame` 合并渲染，使用纯 DOM 节点增量对比更新（杜绝 `innerHTML` XSS 风险，同时保持已生成段落可选中、不闪烁），并实时显示首字耗时、已生成字数与章节目录；成稿后支持一键**复制 Markdown** 或**导出排版完整的独立 HTML**（含已展开的 5W1H 总结）。
+- **流式章节 Checkpoint**：服务端实时扫描已抵达的完整行，每当新的 `## ` 章节标题出现，立即将上一已完成章节持久化到 Durable Object 并推送 `event: chapter`，读者在后续章节仍在流式生成时即可提前点击已完成章节的 `[5W1H]` 按钮。
 
-漏段、乱序或响应提前中断时，服务端从首个未确认的字幕编号有限重试。全部源片段处理完毕并保存章节后才发出 `done`。进度数字用于核对全片材料是否处理到了结尾。检查成稿质量时还要对照原片，看合并后的段落有没有漏掉理由、例子或说话人的保留意见。
+---
 
-## 3. 自然语言要求如何影响文章
+## 3. 自然语言生成要求如何影响输出结果
 
-「写作要求」选填，最多 2,000 个字符。服务端识别任务类型与范围，再把风格、受众和其他约束连同材料提交给模型。[要求识别](src/worker/transcript-intent.ts) · [写作提示](src/worker/gemini.ts)
+核心实现见 [`src/worker/gemini.ts`](src/worker/gemini.ts) 中的 `parseUserRequirements` 与 `streamArticle`。
 
-| 填写的要求 | 用户读到的文章 |
-| --- | --- |
-| 留空，或「面向初学者，分两章，保留原例」 | 根据全片字幕生成整理稿。保留有内容的问答或讲解，让同一回答里的几个论点各自成段。 |
-| 「逐字转写，保留重复和插话」 | 进入逐字模式，逐段转写字幕，保留说话时的反复起头、强调和插话。 |
-| 「只讨论产品定价，为产品经理写一份三百字简报」 | 按用户限定的话题选材，遵循受众、形式和篇幅要求。 |
+采用 **「结构化四维度意图解析 + 约束注入」** 两阶段策略：
 
-例如，受访者先答「大概不会去火星」，再解释自己不愿搬离加州、也许愿意通过 VR 体验。整理后的回答应保留他的倾向、理由和例外。单纯附和可以略去，另一人表达相反意愿则应另起一轮。片头只有嘉宾陈述时，可用一个议题小标题帮助读者进入内容。真实问题可以顺句，署名须有字幕依据，未知身份使用中性称呼。[参考片的编辑尺度](tasks/youtube-to-article.md#演示参考)
+1. **留空零开销**：用户未填写要求时直接跳过解析，零额外延迟与 token 消耗，输出还原参考稿水准的中文深度对话文章。
+2. **四维度结构化提取**：用户填写自然语言要求后，先通过一次轻量的 Gemini Structured Output（`temperature: 0`，强制 JSON Schema）将自然语言归类到题目限定的 4 个维度：
+   - `taskType`（任务类型）
+   - `outputStyle`（输出风格）
+   - `targetAudience`（目标受众）
+   - `constraints`（约束条件数组）
+   系统指令严格限定不脑补未提及的维度、忽略超出范围的注入指令；若解析调用偶发失败则优雅降级为直传原始要求。
+3. **透明展示与强约束注入**：解析结果通过 `event: constraints` 实时推送并在文章顶部展示为「生效约束标签」，同时连同原始表述结构化注入主文章 Prompt，指导模型在保持 `# 标题` / `## 章节` 结构与字幕事实的前提下精准落地用户偏好。
+
+---
 
 ## 4. 如何实现章节级 5W1H 总结
 
-每篇文章使用独立的 Cloudflare Durable Object 保存本次完整字幕、已完成的正文和章节任务。服务端在一个正文章节完成后，将这一章和待执行的总结任务一起持久化。后台依据整片字幕、已保存的文章和该章节生成六项结果。后续章节继续生成，读者可以随时展开已写完章节的 5W1H。
+核心实现见 [`src/worker/session.ts`](src/worker/session.ts) 与 [`src/web/reader.ts`](src/web/reader.ts)。
 
-点击按钮只读取这一章的状态或结果，请求不带字幕、文章或章节文本。
+- **服务端上下文持久化**：每次文章生成会创建独立的 SQLite Durable Object（`ArticleSession`），持久化保存完整视频字幕、已生成正文及分章列表（24 小时后由 `alarm()` 自动清理）。
+- **严格零正文重传**：点击章节标题旁 `[5W1H]` 按钮时，前端仅发送空请求体调用：
+  ```http
+  POST /api/articles/{articleId}/chapters/{chapterId}/summary
+  ```
+  服务端通过 `requireEmptyBody()` 强制校验请求体为空，绝不由前端重新提交文章或字幕内容。
+- **按需生成 + 并发去重 + 持久化缓存**：
+  - 服务端优先读取 Durable Object 中的 `summary/{chapterId}` 缓存（命中返回 `X-Summary-Cache: HIT`）。
+  - 未命中时，结合服务端保存的**完整视频字幕 + 完整文章 + 当前目标章节**调用 Gemini Structured Output（强制返回 `who` / `what` / `when` / `where` / `why` / `how` 六个非空字符串字段；未提及项标为「本章未提及」），写入持久化缓存后返回。
+  - 内存 `inflightSummaries` Map 对同一章节的并发点击去重，避免重复扣减 API 配额。
+- **固定格式渲染**：前端将返回 JSON 固定渲染为六行结构化卡片（Who / What / When / Where / Why / How），收起后再次展开直接复用已加载内容。
 
-```http
-GET /api/articles/{articleId}/chapters/{chapterId}/summary
-```
-
-准备就绪时返回 HTTP 200 和 `who`、`what`、`when`、`where`、`why`、`how` 六个字符串。任务排队或运行中时返回 HTTP 202 和 `Retry-After`。若模型答复截断或缺少字段，后台会退避重试，最多执行三轮任务，对象重启后也能继续。字幕未交代的事项标为「本章未提及」。[任务调度与缓存](src/worker/session.ts)
-
-面板展开期间，遇到网络中断或临时网关错误会自动重连，只读取该章的状态。若服务商限额导致较长等待，面板会按读者的本地时间显示下一次查询时间。收起面板即停止轮询，再次打开已读章节直接显示六项。后台已终止的任务返回 `SUMMARY_FAILED`，页面仍保留章节正文。旧文章缺少预生成结果或已过保存期限时，页面说明需要重新生成文章。[读取与重连](src/web/summary.ts) · [总结面板](src/web/reader.ts)
+---
 
 ## 5. 主要工程取舍与亮点
 
-- **边读边查。** Otter 会按话题更新 Outline，Google Meet 支持查看“截至目前的摘要”。在这里，读者先看到逐段到达的正文，点开某一章才会在面板看到后台准备的六项总结。复制正文会保留章节、小标题和对话段落。[Otter 官方说明](https://help.otter.ai/hc/en-us/articles/5093228433687-Conversation-Page-Overview) · [Google Meet 官方说明](https://support.google.com/meet/answer/14754931?hl=en)
-- **模型成本与等待时间。** 主文章按批次发送字幕以控制单次输出长度，逐章 5W1H 则读取完整字幕以理解跨章背景。按议题整理可减少口头重复的输出，同时仍然需要读取全片材料。后台预计算也会为没有被点开的章节消耗配额，结果就绪后，读者展开面板只需读取缓存。
-- **核对读者实际看到的内容。** 浏览器验收检查正文在 HTTP 响应结束前的可见增长、已处理的字幕范围和各章的 5W1H。长片还可对照开场、中段、收尾的具体发言，检查论据与最后一轮对话是否保留。[浏览器验收脚本](scripts/verify-deployment.mjs)
-- **长文存储。** 服务端接受最多 512 KB 的 UTF-8 字幕，超限会明确提示。长正文按块持久化，每章完成时连同总结队列一起提交。文章与总结保存 24 小时，到期由 Durable Object 清理。按 IP 限制每分钟六次文章生成请求，各 Cloudflare 节点独立计数。[文章会话](src/worker/session.ts)
+| 维度 | 工程取舍与亮点 |
+| --- | --- |
+| **边缘代理可靠性** | 面对 Cloudflare Workers `fetch()` 不支持代理以及 `startTls()` 生产边缘缺失 SNI 的限制，自研 ~300 行纯 WebCrypto TLS 1.3 + HTTP CONNECT 传输层，零第三方加密大依赖、CPU 耗时 <1 ms，且通过真实 OpenSSL TLS 1.3 与 `workerd` 集成测试验证。 |
+| **简洁架构 vs 过度设计** | 摒弃复杂的多轮分批 JSON 编号校验与脆弱正则分类，利用 Gemini 长上下文与原生流式 Markdown 直出，大幅精简代码并显著缩短长视频生成耗时，模块边界清晰易维护。 |
+| **按需 5W1H vs 后台全量预计算** | 改为用户点击时按需生成 + Durable Object 持久缓存 + 并发去重：既不浪费 Gemini AI Studio 免费日配额，又能让用户任意优先点击靠后的章节立即出结果。 |
+| **可解释的四维度要求解析** | 用结构化 Schema 将自由自然语言收敛到任务类型、输出风格、目标受众、约束条件四个可控维度，并在页面可视化展示生效约束，兼具工程可控性与产品体验。 |
 
-## 运行、验证与部署
+---
 
-使用 Node.js 22.12+ 和 npm。首次安装需要能访问 npm 和字幕存档所在的 GitHub Raw 主机。下载后的本地存档可重复使用。
+## 本地开发、测试与部署
 
-```sh
+需要 Node.js 22.12+（推荐 24 LTS）。
+
+```bash
 npm ci
 cp .dev.vars.example .dev.vars
-# 在 .dev.vars 填写 GEMINI_API_KEY
+# 在 .dev.vars 中填写 GEMINI_API_KEY，并可选填写 Webshare 代理列表 PROXY_LIST
 npm run dev
 ```
 
-默认本地地址为 `http://localhost:8787`。本地可在同一份 `.dev.vars` 中配置可选的 `SUPADATA_API_KEY`。按以下顺序检查类型、运行测试、构建并模拟部署。[获取 Gemini API 密钥](https://aistudio.google.com/api-keys)
+运行类型检查、单元测试（含真实 TLS 1.3 代理与 `workerd` Durable Object 集成测试）与构建：
 
-```sh
+```bash
 npm run typecheck
 npm test
 npm run build
 npx wrangler deploy --dry-run
 ```
 
-在 Cloudflare 启用账号的 workers.dev 子域，在 GitHub Actions 的仓库 secrets 中填写 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` 和 `GEMINI_API_KEY`，如需启用 Supadata，再配置可选 Secret `SUPADATA_API_KEY`。运行 **Deploy Worker**。工作流会先测试和构建，再发布 Worker、绑定加密密钥并执行公网验收。运行摘要记录首屏正文出现时间、可见增长次数和全文耗时。默认验收生成一篇整理稿，后台另为每个有正文的章节调用模型生成 5W1H。[部署工作流](.github/workflows/deploy.yml) · [Worker 配置](wrangler.jsonc)
+### Cloudflare Worker 部署
 
-已有部署可使用 Node.js 24 和本机 Chrome 复验。使用 Chromium 时，令 `CHROME_PATH` 指向可执行文件。通过 `--url` 指定要测的链接，默认留空写作要求。用 `--verbatim` 可验收显式逐字转写，用 `--adapted` 验收指定范围的改写。
+在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中配置：
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN`
+- `GEMINI_API_KEY`
+- `PROXY_LIST`（推荐：直接粘贴 Webshare 导出的 10 行 `IP:PORT:USER:PASS` 代理列表）
+- `GEMINI_MODEL`（可选，默认 `gemini-3.1-flash-lite`）
 
-```sh
-node scripts/verify-deployment.mjs https://vedio2report.tf08202000.workers.dev \
-  --url https://youtu.be/U3O1nzSojnc
+手动触发 GitHub Actions 中的 **Deploy Worker** 工作流即可完成构建、测试、发布与公网自动化验收；或使用本地脚本独立验收已部署站点：
+
+```bash
+node scripts/verify-deployment.mjs https://vedio2report.tf08202000.workers.dev
 ```
-
-脚本核对实际视频 ID、正文在响应结束前的可见增长、字幕处理进度和章节 5W1H。测试某条特定字幕路径时，可添加 `--expect-source published-captions`、`--expect-source youtube` 或 `--expect-source native-api`。对于有发布者目录的视频，`--full` 还会核对被保留章节的时间链接与原目录的对应关系。若要复验字幕错误分支，传入相应链接并使用 `--expect-caption-error`，脚本会检查页面显示原因且文章请求数为零。[公网验收脚本](scripts/verify-deployment.mjs)

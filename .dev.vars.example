@@ -1,4 +1,11 @@
-# Copy to .dev.vars for local development. Make your own key in Google AI Studio.
+# Copy to .dev.vars for local development (never commit .dev.vars).
+# Get a free API key from https://aistudio.google.com/api-keys
 GEMINI_API_KEY=
-# Optional server-side Supadata key for reading existing public captions.
-SUPADATA_API_KEY=
+
+# Optional: override default Gemini model (default: gemini-3.1-flash-lite)
+# GEMINI_MODEL=gemini-2.5-flash
+
+# Optional: Webshare.io proxies for YouTube caption extraction via Cloudflare TCP Socket.
+# Supports Webshare format (host:port:username:password) or http://user:pass@host:port,
+# separated by commas or newlines.
+# PROXY_LIST=1.2.3.4:8000:user:pass,5.6.7.8:8000:user:pass

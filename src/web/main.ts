@@ -1,338 +1,441 @@
-import './style.css';
-import { applyIcons } from './icons';
-import { createArticleRenderer, timestampSeconds, type Chapter } from './reader';
-import { events, responseError, retryDelayMs, waitForRetry } from './stream';
-import { loadSummary } from './summary';
-import { sampleMarkdown, sampleChapters, sampleSummaries, sampleSource } from './sample';
+import './style.css'
+import { SUMMARY_KEYS, type ArticleMeta, type ChapterMeta, type ParsedRequirements, type Summary5W1H } from '../shared/types'
+import { applyIcons } from './icons'
+import { createArticleRenderer } from './reader'
+import { sampleChapters, sampleMarkdown, sampleSummaries, sampleVideoId, sampleVideoTitle } from './sample'
+import { parseSseEvents, readResponseError } from './stream'
 
-applyIcons();
-function element<T extends HTMLElement = HTMLElement>(id: string) {
-  const node = document.getElementById(id);
-  if (!node) throw new Error('缺少界面组件 ' + id);
-  return node as T;
-}
-const form = element<HTMLFormElement>('generate');
-const input = element<HTMLInputElement>('video');
-const requirements = element<HTMLTextAreaElement>('requirements');
-const submit = element<HTMLButtonElement>('submit');
-const stop = element<HTMLButtonElement>('stop');
-const copy = element<HTMLButtonElement>('copy');
-const feedback = element('feedback');
-const article = element('article');
-const title = element('reader-title');
-const body = element('body');
-const status = element('reader-status');
-const coverage = element('reader-coverage');
-const source = element('reader-source');
-const timeline = element<HTMLDetailsElement>('reader-timeline');
-const topics = element<HTMLOListElement>('timeline-topics');
-const navSample = element<HTMLAnchorElement>('nav-sample');
-const navStudio = element<HTMLAnchorElement>('nav-studio');
-const modeLabels = {edited: '专题整理稿', verbatim: '逐字转写稿', adapted: '按要求改写'};
-type ArticleMode = keyof typeof modeLabels;
-let pending: AbortController | null = null;
-let readerLifetime = new AbortController();
-let markdown = '';
-let frame = 0;
-let resultIsSample = false;
+applyIcons()
 
-function tell(message: string) {
-  feedback.hidden = !message;
-  feedback.textContent = message;
+function byId<T extends HTMLElement = HTMLElement>(id: string): T {
+  const node = document.getElementById(id)
+  if (!node) throw new Error(`Missing DOM element: #${id}`)
+  return node as T
 }
-function switchNav(sample: boolean) {
-  navSample.classList.toggle('selected', sample);
-  navStudio.classList.toggle('selected', !sample);
+
+const form = byId<HTMLFormElement>('generate')
+const videoInput = byId<HTMLInputElement>('video')
+const requirementsInput = byId<HTMLTextAreaElement>('requirements')
+const submitBtn = byId<HTMLButtonElement>('submit')
+const submitCaption = byId('submit-caption')
+const stopBtn = byId<HTMLButtonElement>('stop')
+const exportHtmlBtn = byId<HTMLButtonElement>('export-html')
+const copyBtn = byId<HTMLButtonElement>('copy')
+const copyLabel = byId('copy-label')
+const feedback = byId('feedback')
+const urlHint = byId('url-hint')
+const fillBtn = byId<HTMLButtonElement>('fill')
+const sampleBtn = byId<HTMLButtonElement>('sample')
+const navStudio = byId<HTMLAnchorElement>('nav-studio')
+const navSample = byId<HTMLAnchorElement>('nav-sample')
+
+const articleSection = byId('article')
+const readerMode = byId('reader-mode')
+const readerPulse = byId('reader-pulse')
+const readerTitle = byId('reader-title')
+const readerSource = byId('reader-source')
+const readerConstraints = byId('reader-constraints')
+const readerToc = byId<HTMLDetailsElement>('reader-toc')
+const tocList = byId<HTMLOListElement>('toc-list')
+const readerStatus = byId('reader-status')
+const bodyContainer = byId('body')
+
+let activeStream: AbortController | null = null
+let articleLifetime = new AbortController()
+let currentMarkdown = ''
+let paintFrame = 0
+
+function showFeedback(message: string) {
+  feedback.hidden = !message
+  feedback.textContent = message
 }
-function openResult(sample: boolean) {
-  readerLifetime.abort();
-  readerLifetime = new AbortController();
-  cancelAnimationFrame(frame);
-  frame = 0;
-  article.hidden = false;
-  resultIsSample = sample;
-  markdown = '';
-  body.replaceChildren();
-  copy.hidden = true;
-  element('copy-label').textContent = '复制正文';
-  element('reader-mode').textContent = sample ? '排版样稿 · 参考稿节选' : '视频字幕成稿';
-  title.textContent = sample ? '排版样稿' : '正在准备字幕…';
-  source.textContent = '';
-  topics.replaceChildren();
-  timeline.open = false;
-  timeline.hidden = true;
-  status.textContent = '';
-  coverage.textContent = '';
-  coverage.hidden = true;
-  switchNav(sample);
-  article.scrollIntoView({ block: 'start' });
-  title.focus({ preventScroll: true });
+
+function setActiveNav(isSample: boolean) {
+  navSample.classList.toggle('selected', isSample)
+  navStudio.classList.toggle('selected', !isSample)
 }
-function showSample() {
-  if (pending) { tell('正在生成文章。如需切换到示例，请先停止生成。'); feedback.scrollIntoView({ block: 'center' }); return; }
-  openResult(true);
-  markdown = sampleMarkdown;
-  const links = new Map<number, string>();
-  displaySource(sampleSource, links);
-  source.append(' · 章节 5W1H 为预置示例');
-  const render = createArticleRenderer(body, title, async id => sampleSummaries[id], links, readerLifetime.signal);
-  render(markdown, sampleChapters);
-  copy.hidden = false;
-}
-element('sample').addEventListener('click', showSample);
-navSample.addEventListener('click', event => { event.preventDefault(); showSample(); });
-navStudio.addEventListener('click', () => { switchNav(false); input.focus({ preventScroll: true }); });
-element('fill').addEventListener('click', () => {
-  input.value = 'https://www.youtube.com/watch?v=' + sampleSource.videoId;
-  input.setCustomValidity('');
-  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可整理。';
-  tell('');
-  input.focus();
-});
-input.addEventListener('input', () => {
-  input.setCustomValidity('');
-  element('url-hint').textContent = '支持带字幕的 YouTube 公开视频。';
-});
-stop.addEventListener('click', () => pending?.abort());
 
 function setBusy(busy: boolean) {
-  submit.disabled = busy;
-  stop.hidden = !busy;
-  input.readOnly = busy;
-  requirements.readOnly = busy;
-  element<HTMLButtonElement>('fill').disabled = busy;
-  element('submit-caption').textContent = busy ? '检查字幕中…' : '开始生成';
-  stop.textContent = busy ? '取消' : '停止生成';
-}
-function sourceName(kind: string, downloaded?: boolean) {
-  if (kind === 'reference-excerpt') return '参考稿节选';
-  if (kind === 'cached') return 'W3C WAI 官方逐字稿';
-  if (kind === 'archived-youtube') return 'YouTube 字幕存档';
-  if (kind === 'published-captions') return '公开发布的字幕';
-  if (kind === 'native-api') return '第三方服务提供的 YouTube 字幕';
-  if (kind === 'youtube' && downloaded !== undefined) {
-    return downloaded ? 'YouTube 视频字幕 · 已完整下载' : 'YouTube 视频字幕 · 已读取服务端下载缓存';
+  submitBtn.disabled = busy
+  stopBtn.hidden = !busy
+  videoInput.readOnly = busy
+  requirementsInput.readOnly = busy
+  fillBtn.disabled = busy
+  for (const chip of document.querySelectorAll<HTMLButtonElement>('.preset-chip')) {
+    chip.disabled = busy
   }
-  return kind === 'youtube' ? 'YouTube 视频字幕' : '视频字幕';
-}
-interface SourceMeta {
-  source: string;
-  videoId: string;
-  title?: string;
-  sourceUrl?: string;
-  sourceLabel?: string;
-  durationSeconds?: number;
-  lastCaptionSeconds?: number;
-  cueCount?: number;
-  timeline?: {at: string; topic?: string}[];
+  submitCaption.textContent = busy ? '正在生成中…' : '开始流式生成'
+  readerPulse.classList.toggle('pulsing', busy)
 }
 
-async function prepareCaptions(url: string, signal: AbortSignal) {
-  const check = () => fetch('/api/captions', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}), signal,
-  });
-  let response = await check();
-  let downloaded = false;
-  let rechecked = false;
-  for (;;) {
-    if (!response.ok) throw await responseError(response, '字幕检查失败');
-    const data = await response.json();
-    if (!data || !/^[a-zA-Z0-9_-]{11}$/.test(data.videoId)) throw new Error('字幕状态无效，请重新检查。');
-    if (response.status === 200 && data.status === 'ready') return {source: data as SourceMeta, downloaded};
-    if (response.status !== 202 || !['checking', 'pending', 'running'].includes(data.status)) throw new Error('字幕状态无效，请重新检查。');
-    downloaded = true;
-    element('submit-caption').textContent = '准备字幕中…';
-    if (data.status === 'checking') status.textContent = '正在等待字幕服务确认该视频是否有可读字幕…';
-    else status.textContent = data.status === 'pending' ? '已确认有字幕，正在等待下载…' : '已确认有字幕，正在下载完整字幕文件…';
-    await waitForRetry(retryDelayMs(response.headers.get('Retry-After')), signal);
-    response = await fetch('/api/captions/' + data.videoId, {signal, cache: 'no-store'});
-    if (response.status === 404 && !rechecked) {
-      rechecked = true;
-      downloaded = false;
-      status.textContent = '正在重新检查字幕下载状态…';
-      response = await check();
-    }
+function formatDuration(seconds: number): string {
+  const total = Math.floor(seconds)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = String(total % 60).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`
+}
+
+function sourceBadgeLabel(source: ArticleMeta['source']): string {
+  switch (source) {
+    case 'youtube-proxy':
+      return 'YouTube 字幕（代理获取）'
+    case 'youtube-direct':
+      return 'YouTube 字幕（直连）'
+    case 'archive':
+      return '内置演示字幕兜底'
   }
 }
 
-function timecode(seconds: number) {
-  const total = Math.floor(seconds);
-  const hh = Math.floor(total / 3600);
-  const mm = Math.floor(total / 60) % 60;
-  const ss = String(total % 60).padStart(2, '0');
-  return hh ? hh + ':' + String(mm).padStart(2, '0') + ':' + ss : mm + ':' + ss;
+function renderSourceMeta(meta: ArticleMeta) {
+  readerSource.replaceChildren()
+  const badge = document.createElement('span')
+  badge.className = 'source-badge'
+  badge.textContent = sourceBadgeLabel(meta.source)
+  readerSource.append(badge)
+
+  const link = document.createElement('a')
+  link.href = `https://www.youtube.com/watch?v=${meta.videoId}`
+  link.target = '_blank'
+  link.rel = 'noopener noreferrer'
+  link.textContent = meta.title
+  readerSource.append(' · ', link)
+
+  if (typeof meta.durationSeconds === 'number' && meta.durationSeconds > 0) {
+    readerSource.append(` · 时长 ${formatDuration(meta.durationSeconds)}`)
+  }
+  if (typeof meta.cueCount === 'number' && meta.cueCount > 0) {
+    readerSource.append(` · ${meta.cueCount.toLocaleString('zh-CN')} 条字幕`)
+  }
 }
 
-function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?: boolean) {
-  source.textContent = sourceName(meta.source, downloaded);
-  if (meta.source === 'published-captions' || meta.source === 'reference-excerpt') {
-    const label = meta.sourceLabel?.trim();
-    let sourceUrl: URL | undefined;
-    if (meta.sourceUrl && URL.canParse(meta.sourceUrl)) sourceUrl = new URL(meta.sourceUrl);
-    if (sourceUrl?.protocol === 'https:' && !sourceUrl.username && !sourceUrl.password) {
-      const credit = document.createElement('a');
-      credit.href = sourceUrl.href;
-      credit.target = '_blank';
-      credit.rel = 'noopener noreferrer';
-      credit.textContent = label || '字幕来源';
-      source.append(' · ', credit);
-    } else if (label) source.append(' · ', label);
+function renderConstraints(parsed: ParsedRequirements) {
+  readerConstraints.replaceChildren()
+  const pills: Array<[string, string]> = []
+  if (parsed.taskType) pills.push(['任务类型', parsed.taskType])
+  if (parsed.outputStyle) pills.push(['输出风格', parsed.outputStyle])
+  if (parsed.targetAudience) pills.push(['目标受众', parsed.targetAudience])
+  for (const item of parsed.constraints) {
+    pills.push(['约束条件', item])
   }
-  topics.replaceChildren();
-  links.clear();
-  const video = /^[a-zA-Z0-9_-]{11}$/.test(meta.videoId) ? 'https://www.youtube.com/watch?v=' + meta.videoId : '';
-  if (video) {
-    const link = document.createElement('a');
-    link.href = video;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.textContent = meta.title || '查看原视频';
-    source.append(' · ', link);
+  if (!pills.length) {
+    readerConstraints.hidden = true
+    return
   }
-  if (typeof meta.durationSeconds === 'number' && Number.isFinite(meta.durationSeconds) && meta.durationSeconds > 0) {
-    source.append(' · 原片时长 ' + timecode(meta.durationSeconds));
+
+  for (const [label, value] of pills) {
+    const tag = document.createElement('span')
+    tag.className = 'constraint-pill'
+    const strong = document.createElement('strong')
+    strong.textContent = label
+    tag.append(strong, ' ', value)
+    readerConstraints.append(tag)
   }
-  if (typeof meta.lastCaptionSeconds === 'number' && Number.isFinite(meta.lastCaptionSeconds) && meta.lastCaptionSeconds >= 0) {
-    source.append(' · 字幕截至 ' + timecode(meta.lastCaptionSeconds));
-  }
-  if (typeof meta.cueCount === 'number' && Number.isSafeInteger(meta.cueCount) && meta.cueCount > 0) {
-    source.append(' · ' + meta.cueCount.toLocaleString('zh-CN') + ' 条字幕');
-  }
-  if (video && Array.isArray(meta.timeline)) {
-    for (const entry of meta.timeline) {
-      const seconds = timestampSeconds(entry.at);
-      if (seconds === undefined) continue;
-      const href = video + '&t=' + seconds + 's';
-      links.set(seconds, href);
-      if (!entry.topic) continue;
-      const item = document.createElement('li');
-      const link = document.createElement('a');
-      link.href = href;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      const time = document.createElement('time');
-      time.dateTime = 'PT' + seconds + 'S';
-      time.textContent = entry.at;
-      link.append(time, entry.topic);
-      item.append(link);
-      topics.append(item);
-    }
-  }
-  timeline.hidden = !topics.childElementCount;
+  readerConstraints.hidden = false
 }
 
-function displayCoverage(data: {completed: number; total: number}, mode?: ArticleMode) {
-  if (!Number.isSafeInteger(data.completed) || !Number.isSafeInteger(data.total) ||
-      data.total <= 0 || data.completed < 0 || data.completed > data.total) return;
-  const label = mode === 'verbatim' ? '已转写字幕片段' : '已处理字幕片段';
-  coverage.textContent = label + ' ' + data.completed + ' / ' + data.total;
-  coverage.hidden = false;
+function resetReader(isSample: boolean) {
+  articleLifetime.abort()
+  articleLifetime = new AbortController()
+  cancelAnimationFrame(paintFrame)
+  paintFrame = 0
+  currentMarkdown = ''
+
+  articleSection.hidden = false
+  bodyContainer.replaceChildren()
+  readerSource.replaceChildren()
+  readerConstraints.replaceChildren()
+  readerConstraints.hidden = true
+  tocList.replaceChildren()
+  readerToc.open = false
+  readerToc.hidden = true
+  copyBtn.hidden = true
+  exportHtmlBtn.hidden = true
+  copyLabel.textContent = '复制 Markdown'
+  readerMode.textContent = isSample ? '参考样稿 · 排版与 5W1H 示例' : 'Gemini 实时流式成稿'
+  readerTitle.textContent = isSample ? '参考样稿' : '正在获取视频字幕…'
+  readerStatus.textContent = ''
+  setActiveNav(isSample)
+  articleSection.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
-form.addEventListener('submit', async event => {
-  event.preventDefault();
-  if (pending) return;
-  const url = input.value.trim();
-  const controller = new AbortController();
-  pending = controller;
-  setBusy(true);
-  tell('');
-  openResult(false);
-  status.textContent = '正在检查可用字幕，确认后下载并生成正文…';
-  let id = '';
-  let mode: ArticleMode | undefined;
-  let captionsReady = false;
-  const readyChapters: Chapter[] = [];
-  let complete = false;
-  const links = new Map<number, string>();
-  const render = createArticleRenderer(body, title, (chapter, signal, onStatus) => loadSummary(id, chapter, signal, onStatus), links, readerLifetime.signal);
-  function paint() {
-    frame = 0;
-    render(markdown, readyChapters);
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function buildStandaloneHtml(): string {
+  const titleText = readerTitle.textContent?.trim() || '声稿文章'
+  const clone = bodyContainer.cloneNode(true) as HTMLElement
+  for (const btn of clone.querySelectorAll('.summary-toggle, .summary-retry')) btn.remove()
+  for (const box of clone.querySelectorAll<HTMLElement>('.summary-box')) {
+    if (box.hidden || !box.querySelector('.summary-grid')) box.remove()
   }
-  function schedulePaint() {
-    if (!frame) frame = requestAnimationFrame(paint);
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${escapeHtml(titleText)}</title>
+<style>
+  body { margin: 0; background: #f8f7f2; color: #222421; font-family: Georgia, "Noto Serif CJK SC", "Songti SC", serif; line-height: 1.9; }
+  main { max-width: 820px; margin: 36px auto; padding: 36px 44px; background: #fffefa; border: 1px solid #dcdad0; border-radius: 12px; }
+  h1 { font-size: 34px; line-height: 1.38; margin: 0 0 12px; }
+  .meta { font-family: system-ui, sans-serif; font-size: 13px; color: #64655e; margin-bottom: 24px; }
+  .chapter-head { border-top: 1px solid #dcdad0; padding-top: 22px; margin-top: 28px; }
+  h3 { font-size: 23px; margin: 0; }
+  h4 { font-size: 19px; margin: 1.3em 0 0.5em; }
+  p { margin: 0.9em 0; font-size: 17px; }
+  .summary-box { margin: 14px 0 18px; background: #f6f3e9; border: 1px solid #e3decc; border-radius: 10px; padding: 14px 18px; font-family: system-ui, sans-serif; font-size: 14.5px; }
+  .summary-header { font-size: 11px; font-weight: 700; color: #a23c25; margin-bottom: 6px; }
+  .summary-grid { margin: 0; }
+  .summary-row { display: grid; grid-template-columns: 74px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid #e2decb; }
+  .summary-row:last-child { border-bottom: 0; }
+  .summary-row dt { font-family: Georgia, serif; font-weight: 700; color: #a23c25; }
+  .summary-row dd { margin: 0; }
+  blockquote { margin: 1em 0; padding: 0.5em 1em; background: #f5f2e9; border-left: 3px solid #a23c25; }
+</style>
+</head>
+<body>
+<main>
+  <h1>${escapeHtml(titleText)}</h1>
+  <p class="meta">${escapeHtml(readerSource.textContent?.trim() || '')}</p>
+  ${clone.innerHTML}
+</main>
+</body>
+</html>`
+}
+
+async function fetchChapterSummary(articleId: string, chapterId: string, signal: AbortSignal): Promise<Summary5W1H> {
+  // Strictly sends only articleId + chapterId with an empty body (server uses stored context).
+  const response = await fetch(
+    `/api/articles/${encodeURIComponent(articleId)}/chapters/${encodeURIComponent(chapterId)}/summary`,
+    { method: 'POST', cache: 'no-store', signal },
+  )
+  if (!response.ok) {
+    throw await readResponseError(response, '获取章节 5W1H 总结失败')
   }
+  const data = (await response.json()) as Partial<Summary5W1H>
+  if (!data || SUMMARY_KEYS.some(key => typeof data[key] !== 'string' || !data[key]!.trim())) {
+    throw new Error('服务端返回的 5W1H 数据结构不完整，请重试。')
+  }
+  return data as Summary5W1H
+}
+
+function openSample() {
+  if (activeStream) {
+    showFeedback('文章正在流式生成中，如需查看参考样稿请先点击「停止生成」。')
+    feedback.scrollIntoView({ block: 'center' })
+    return
+  }
+  showFeedback('')
+  resetReader(true)
+  currentMarkdown = sampleMarkdown
+
+  const badge = document.createElement('span')
+  badge.className = 'source-badge'
+  badge.textContent = '参考排版样稿'
+  const link = document.createElement('a')
+  link.href = `https://www.youtube.com/watch?v=${sampleVideoId}`
+  link.target = '_blank'
+  link.rel = 'noopener noreferrer'
+  link.textContent = sampleVideoTitle
+  readerSource.append(badge, ' · ', link, ' · 点击章节旁 [5W1H] 按钮查看示例总结')
+
+  const render = createArticleRenderer(
+    bodyContainer,
+    readerTitle,
+    readerToc,
+    tocList,
+    async chapterId => sampleSummaries[chapterId],
+    articleLifetime.signal,
+  )
+  render(sampleMarkdown, sampleChapters)
+  copyBtn.hidden = false
+  exportHtmlBtn.hidden = false
+}
+
+sampleBtn.addEventListener('click', openSample)
+navSample.addEventListener('click', ev => {
+  ev.preventDefault()
+  openSample()
+})
+navStudio.addEventListener('click', () => {
+  setActiveNav(false)
+  videoInput.focus({ preventScroll: true })
+})
+
+fillBtn.addEventListener('click', () => {
+  videoInput.value = `https://www.youtube.com/watch?v=${sampleVideoId}`
+  videoInput.setCustomValidity('')
+  urlHint.textContent = '已填入《马克·安德森 2026 AI 展望》访谈链接，点击「开始流式生成」即可体验。'
+  showFeedback('')
+  videoInput.focus()
+})
+
+for (const chip of document.querySelectorAll<HTMLButtonElement>('.preset-chip')) {
+  chip.addEventListener('click', () => {
+    requirementsInput.value = chip.dataset.preset ?? ''
+    requirementsInput.focus()
+  })
+}
+
+videoInput.addEventListener('input', () => {
+  videoInput.setCustomValidity('')
+  urlHint.textContent = '支持任意公开且带字幕的 YouTube 链接（自动经代理池读取，演示视频内置兜底字幕）。'
+})
+
+stopBtn.addEventListener('click', () => activeStream?.abort())
+
+copyBtn.addEventListener('click', async () => {
+  if (!currentMarkdown) return
   try {
-    const captions = await prepareCaptions(url, controller.signal);
-    captionsReady = true;
-    displaySource(captions.source, links, captions.downloaded);
-    status.textContent = '字幕已就绪，正在连接 Gemini…';
-    title.textContent = '正在准备中文稿…';
-    element('submit-caption').textContent = '生成中…';
-    stop.textContent = '停止生成';
+    await navigator.clipboard.writeText(currentMarkdown)
+    copyLabel.textContent = '已复制 Markdown'
+    setTimeout(() => {
+      copyLabel.textContent = '复制 Markdown'
+    }, 1800)
+  } catch {
+    showFeedback('浏览器未授予剪贴板权限，请手动选中正文复制。')
+  }
+})
+
+exportHtmlBtn.addEventListener('click', () => {
+  if (!currentMarkdown) return
+  const html = buildStandaloneHtml()
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  const safeName = (readerTitle.textContent?.trim() || 'article').replace(/[\\/:*?"<>|]/g, '_')
+  link.href = url
+  link.download = `${safeName}.html`
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+})
+
+function countProseChars(markdown: string): number {
+  return markdown.replace(/[#*`>\s]/g, '').length
+}
+
+form.addEventListener('submit', async ev => {
+  ev.preventDefault()
+  if (activeStream) return
+
+  const url = videoInput.value.trim()
+  const requirements = requirementsInput.value.trim()
+  const controller = new AbortController()
+  activeStream = controller
+
+  showFeedback('')
+  setBusy(true)
+  resetReader(false)
+  readerStatus.textContent = '正在获取并校验 YouTube 字幕…'
+
+  const startedAt = performance.now()
+  let ttftSeconds: string | undefined
+  let articleId = ''
+  const readyChapters: ChapterMeta[] = []
+  let completed = false
+
+  const render = createArticleRenderer(
+    bodyContainer,
+    readerTitle,
+    readerToc,
+    tocList,
+    (chapterId, signal) => fetchChapterSummary(articleId, chapterId, signal),
+    articleLifetime.signal,
+  )
+
+  const schedulePaint = () => {
+    if (paintFrame) return
+    paintFrame = requestAnimationFrame(() => {
+      paintFrame = 0
+      render(currentMarkdown, readyChapters)
+    })
+  }
+
+  try {
     const response = await fetch('/api/articles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, requirements: requirements.value.trim() }),
+      body: JSON.stringify({ url, requirements }),
       signal: controller.signal,
-    });
-    if (!response.ok) throw await responseError(response, '生成失败');
-    for await (const event of events(response)) {
-      const { type, data } = event;
-      if (type === 'meta') {
-        id = data.articleId;
-        const eventMode: unknown = data.mode;
-        if (eventMode === 'edited' || eventMode === 'verbatim' || eventMode === 'adapted') {
-          mode = eventMode;
-          element('reader-mode').textContent = modeLabels[mode];
+    })
+
+    if (!response.ok) {
+      throw await readResponseError(response, '文章生成请求失败')
+    }
+
+    for await (const event of parseSseEvents(response)) {
+      if (event.type === 'meta') {
+        const meta = event.data as ArticleMeta
+        articleId = meta.articleId
+        renderSourceMeta(meta)
+        readerTitle.textContent = requirements ? '正在解析生成要求…' : '正在流式生成文章…'
+        readerStatus.textContent = requirements
+          ? '字幕已就绪，正在解析自然语言要求并开始流式生成…'
+          : '字幕已就绪，Gemini 正在流式写作…'
+      } else if (event.type === 'constraints') {
+        renderConstraints(event.data as ParsedRequirements)
+        readerStatus.textContent = '已应用上述生成要求，Gemini 正在流式写作…'
+      } else if (event.type === 'delta') {
+        const { text } = event.data as { text: string }
+        if (!ttftSeconds) {
+          ttftSeconds = ((performance.now() - startedAt) / 1000).toFixed(1)
         }
-        displaySource(data, links, captions.downloaded);
-        status.textContent = '字幕已就绪，正在等待 Gemini 输出正文…';
-      } else if (type === 'delta' && typeof data.text === 'string') {
-        if (!markdown) status.textContent = '正在生成正文…';
-        markdown += data.text;
-        schedulePaint();
-      } else if (type === 'coverage') {
-        displayCoverage(data, mode);
-      } else if (type === 'chapter' && data.id === 'ch-' + (readyChapters.length + 1) && typeof data.title === 'string') {
-        readyChapters.push({id: data.id, title: data.title});
-        status.textContent = '已完成 ' + readyChapters.length + ' 章，可展开 5W1H';
-        schedulePaint();
-      } else if (type === 'error') {
-        throw new Error(typeof data.message === 'string' ? data.message : '生成中断，请重试。');
-      } else if (type === 'done') {
-        if (!Array.isArray(data.chapters)) throw new Error('章节信息缺失，请重新生成。');
-        if (data.coverage) displayCoverage(data.coverage, mode);
-        readyChapters.splice(0, readyChapters.length, ...data.chapters);
-        complete = true;
+        currentMarkdown += text
+        const chars = countProseChars(currentMarkdown).toLocaleString('zh-CN')
+        readerStatus.textContent = `正在实时流式输出 · 首字 ${ttftSeconds}s · 已生成 ${chars} 字${readyChapters.length ? ` · ${readyChapters.length} 章可展开 5W1H` : ''}`
+        schedulePaint()
+      } else if (event.type === 'chapter') {
+        readyChapters.push(event.data as ChapterMeta)
+        schedulePaint()
+      } else if (event.type === 'done') {
+        const { chapters } = event.data as { chapters: ChapterMeta[] }
+        readyChapters.splice(0, readyChapters.length, ...chapters)
+        completed = true
+        cancelAnimationFrame(paintFrame)
+        paintFrame = 0
+        render(currentMarkdown, readyChapters)
+        const totalSec = ((performance.now() - startedAt) / 1000).toFixed(1)
+        const chars = countProseChars(currentMarkdown).toLocaleString('zh-CN')
+        readerStatus.textContent = `生成完成 · 共 ${chapters.length} 章 · ${chars} 字 · 耗时 ${totalSec}s${ttftSeconds ? `（首字 ${ttftSeconds}s）` : ''} · 点击章节旁 [5W1H] 查看总结`
+        copyBtn.hidden = false
+        exportHtmlBtn.hidden = false
+      } else if (event.type === 'error') {
+        const { message } = event.data as { message?: string }
+        throw new Error(message || '生成过程中发生错误，请稍后重试。')
       }
     }
-    if (!complete || !readyChapters.length || !id || !markdown.trim()) throw new Error('连接提前结束，请重新生成。');
-    cancelAnimationFrame(frame);
-    paint();
-    status.textContent = '生成完成 · ' + readyChapters.length + ' 个章节';
-    copy.hidden = false;
+
+    if (!completed && !controller.signal.aborted) {
+      throw new Error('生成流意外中断，请重新生成。')
+    }
   } catch (error) {
-    cancelAnimationFrame(frame);
-    frame = 0;
-    const message = controller.signal.aborted
-      ? (captionsReady ? '已停止生成。' : '已取消本次字幕请求。')
-      : error instanceof Error ? error.message : '网络连接失败，请重试。';
-    if (markdown.trim()) {
-      render(markdown, readyChapters);
-      status.textContent = message + ' 已保留收到的正文片段。';
-      copy.hidden = false;
-    } else if (captionsReady) {
-      title.textContent = '视频字幕记录';
-      status.textContent = message;
+    if (controller.signal.aborted) {
+      readerStatus.textContent = currentMarkdown
+        ? '已停止生成。已输出的内容与已完成章节仍可正常阅读。'
+        : '已取消本次生成。'
+      if (currentMarkdown) {
+        copyBtn.hidden = false
+        exportHtmlBtn.hidden = false
+      }
     } else {
-      article.hidden = true;
-      tell(message);
-      feedback.scrollIntoView({ block: 'nearest' });
+      const msg = error instanceof Error ? error.message : '请求失败，请稍后重试。'
+      showFeedback(msg)
+      readerStatus.textContent = ''
+      if (!currentMarkdown) {
+        articleSection.hidden = true
+      } else {
+        copyBtn.hidden = false
+        exportHtmlBtn.hidden = false
+      }
     }
   } finally {
-    pending = null;
-    setBusy(false);
+    if (activeStream === controller) activeStream = null
+    setBusy(false)
   }
-});
-copy.addEventListener('click', async () => {
-  const text = markdown;
-  const sample = resultIsSample;
-  try {
-    await navigator.clipboard.writeText(text);
-    if (text === markdown && sample === resultIsSample) element('copy-label').textContent = '已复制';
-  } catch {
-    element('copy-label').textContent = '请选中正文复制';
-  }
-});
+})
