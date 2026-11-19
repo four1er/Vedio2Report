@@ -52,14 +52,14 @@ describe("durable caption downloads", () => {
     expect(discoverCaptions).toHaveBeenCalledTimes(1);
     expect(downloadCaptions).not.toHaveBeenCalled();
     await app.alarm();
-    expect(downloadCaptions).toHaveBeenCalledWith(track);
+    expect(downloadCaptions).toHaveBeenCalledWith(track, {});
     const retryAt = (await app.storage.getAlarm())!;
     app.restart();
     await app.alarm();
     expect(downloadCaptions).toHaveBeenCalledTimes(1);
     const clock = vi.spyOn(Date, "now").mockReturnValue(retryAt);
     await app.alarm();
-    expect(downloadCaptions).toHaveBeenLastCalledWith(newer);
+    expect(downloadCaptions).toHaveBeenLastCalledWith(newer, {});
     const expected = {status: "ready", videoId, title: captions.title, source: "youtube", cueCount: 2};
     expect(await (await app.request("status")).json()).toEqual(expected);
     expect(await (await app.request("prepare")).json()).toEqual(expected);

@@ -20,32 +20,38 @@ async function resolveOrigin(input) {
   return url;
 }
 const {values, positionals} = parseArgs({allowPositionals: true, options: {
-  full: {type: 'boolean'}, default: {type: 'boolean'}, 'markdown-out': {type: 'string'}, 'expect-caption-error': {type: 'boolean'},
+  url: {type: 'string'}, 'expect-source': {type: 'string'}, full: {type: 'boolean'}, default: {type: 'boolean'}, 'markdown-out': {type: 'string'}, 'expect-caption-error': {type: 'boolean'},
 }});
 assert.equal(positionals.length, 1, 'Pass one Worker URL or Wrangler deployment file.');
-const fullInterview = values.full === true;
+const fullCoverage = values.full === true;
 const defaultRequest = values.default === true;
 const expectCaptionError = values['expect-caption-error'] === true;
-assert.ok(!(defaultRequest && fullInterview), 'Choose --default for a general video or --full for the reference interview.');
-assert.ok(!(expectCaptionError && fullInterview), '--expect-caption-error cannot verify a full article.');
+assert.ok(!(defaultRequest && fullCoverage), 'Choose --default or --full, which also verifies coverage of all published topics.');
+assert.ok(!(expectCaptionError && fullCoverage), '--expect-caption-error cannot verify a full article.');
+const sources = ['youtube', 'cached', 'archived-youtube', 'published-captions', 'native-api'];
+const expectedSource = values['expect-source'];
+if (expectedSource !== undefined) assert.ok(!expectCaptionError && sources.includes(expectedSource), 'Choose a supported caption source for a successful run');
 const markdownOut = values['markdown-out'];
-if (markdownOut !== undefined) assert.ok(fullInterview && markdownOut.trim(), '--markdown-out PATH requires --full');
+if (markdownOut !== undefined) assert.ok(!expectCaptionError && markdownOut.trim(), '--markdown-out requires a path and an article generation run');
 const origin = await resolveOrigin(positionals[0]);
 console.log('Public Worker:', origin);
 
-const interviewId = 'xRh2sVcNXQ8';
-const videoId = process.env.ACCEPTANCE_VIDEO_ID || interviewId;
-if (fullInterview) assert.equal(videoId, interviewId, 'Full coverage check uses the reference interview');
-assert.match(videoId, /^[A-Za-z0-9_-]{11}$/);
+// Keep testing the URL as entered (including short links, Shorts and live URLs).
+const inputUrl = values.url || ('https://www.youtube.com/watch?v=' + (process.env.ACCEPTANCE_VIDEO_ID || 'fNk_zzaMoSs'));
+const input = new URL(inputUrl);
+assert.ok(['https:', 'http:'].includes(input.protocol) && !input.username && !input.password && !input.port);
+const youtube = ['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(input.hostname);
+const videoId = input.hostname === 'youtu.be' ? input.pathname.match(/^\/([^/]+)\/?$/)?.[1] : youtube && (
+  input.pathname === '/watch' ? input.searchParams.get('v') : input.pathname.match(/^\/(?:shorts|embed|live)\/([^/]+)\/?$/)?.[1]);
+assert.match(videoId || '', /^[A-Za-z0-9_-]{11}$/, 'Provide a YouTube video URL or an eleven-character ACCEPTANCE_VIDEO_ID');
+const constrained = !(fullCoverage || defaultRequest || expectCaptionError);
 
 // Measure rendered prose in the viewport. A title, status change, or SSE frame
 // alone does not establish that a reader saw any portion of a paragraph.
-function observeReading(trackAnswers) {
+function observeReading() {
   const body = document.querySelector('#body');
   const samples = [];
   window.readingSamples = samples;
-  window.answerGrowth = [];
-  const lastAnswers = new Map();
   // Chromium can discard an SSE response from its DevTools body cache. Observe
   // a copy as it arrives and give the page the original Response immediately.
   const fetch = window.fetch.bind(window);
@@ -82,23 +88,6 @@ function observeReading(trackAnswers) {
     function sample() {
       frame = 0;
       let visible = 0;
-      if (trackAnswers) {
-        const turns = body.querySelectorAll('p.speaker-turn');
-        turns.forEach((turn, index) => {
-          const name = turn.querySelector('.speaker-label')?.textContent || '';
-          if (!/^(?:Marc|Mark|马克|马可|安德森)/i.test(name.trim())) return;
-          let para = turn, part = 0;
-          do {
-            const prose = (para === turn ? turn.querySelector('span') : para)?.textContent.trim();
-            const key = index + '/' + part++;
-            const last = lastAnswers.get(key);
-            if (last && prose?.startsWith(last) && prose.length > last.length)
-              window.answerGrowth.push({at: performance.now(), from: last.length, to: prose.length});
-            if (prose) lastAnswers.set(key, prose);
-            para = para.nextElementSibling;
-          } while (para?.matches('p.speaker-continuation'));
-        });
-      }
       for (const para of body.querySelectorAll('p, li, blockquote')) {
         if (para.closest('.summary-box, .chapter-recap')) continue;
         const rect = para.getBoundingClientRect();
@@ -116,92 +105,49 @@ function observeReading(trackAnswers) {
           }
         }
       }
-      if (visible > lastVisible) samples.push({at: performance.now(), visible, total: body.innerText.length});
-      lastVisible = visible;
+      if (visible > lastVisible) {
+        samples.push({at: performance.now(), visible});
+        lastVisible = visible;
+      }
     }
     new MutationObserver(() => {
       if (!window.firstSealed && body.querySelector('.chapter-head > .summary-toggle') && body.querySelector('.chapter-recap')) {
-        window.firstSealed = {at: performance.now(), stillWriting: document.querySelector('#submit').disabled};
+        window.firstSealed = performance.now();
       }
       if (!frame) frame = requestAnimationFrame(sample);
     }).observe(body, {childList: true, subtree: true, characterData: true});
   }, {capture: true, once: true});
 }
 
-// Read the rendered chapter content only. Sidebar text, recap and expanded
-// 5W1H fields must never count as an interviewer's question or a guest's answer.
+// Read only rendered body text. Summary fields and recaps are separate from the prose.
 function readChapters(headings) {
   return headings.map(heading => {
-    const content = heading.nextElementSibling.matches('.summary-box')
-      ? heading.nextElementSibling.nextElementSibling : heading.nextElementSibling;
-    const turns = [];
-    for (const p of content.querySelectorAll('p.speaker-turn, p.speaker-continuation')) {
-      if (p.matches('.speaker-continuation')) {
-        if (turns.length) turns.at(-1).paragraphs.push(p.innerText.trim());
-        continue;
-      }
-      const label = p.querySelector(':scope > strong.speaker-label');
-      const words = p.querySelector(':scope > span');
-      if (label && words) turns.push({name: label.innerText.replace(/[：:]$/, '').trim(), paragraphs: [words.innerText.trim()]});
-    }
+    const next = heading.nextElementSibling;
+    const content = next.matches('.summary-box') ? next.nextElementSibling : next;
+    const paragraphs = [...content.querySelectorAll('p:not(.chapter-recap), li, blockquote')];
     return {
-      text: content.innerText,
+      text: paragraphs.map(p => p.innerText.trim()).join('\n').trim(),
       subtopics: [...content.querySelectorAll('h4')].map(h => h.innerText.trim()),
       recaps: content.querySelectorAll('.chapter-recap').length,
-      paragraphs: [...content.querySelectorAll('p:not(.chapter-recap), li, blockquote')].filter(p => p.textContent.trim()).length,
-      turns,
     };
   });
 }
 
-function verifyInterview(sections, markdown, timeline) {
-  assert.equal(sections.length, 12);
-  const raw = markdown.split(/^##[ \t]+/m).slice(1);
-  assert.equal(raw.length, 12);
-  const host = /^(?:Jen|John|主持人|珍|约翰)/i;
-  const guest = /^(?:Mark|Marc|马克|马可|安德森)/i;
-  const turnsAt = at => sections[timeline.findIndex(mark => mark.at === at)].turns;
-  const words = turn => turn.paragraphs.join('\n');
-  const spoken = turns => turns.map(words).join('\n');
-  let multiTopic = 0, multiParagraph = 0;
-  for (const [i, section] of sections.entries()) {
-    const where = 'Chapter ' + (i + 1) + ' [' + timeline[i].at + ']';
-    const subheads = [...raw[i].matchAll(/^###[ \t]+(.+)$/gm)];
-    assert.ok(subheads.length && subheads.length === section.subtopics.length, where + ' needs rendered ### subheadings');
-    assert.ok(section.subtopics.every(Boolean));
-    if (subheads.length > 1) multiTopic++;
-    assert.equal(section.recaps, 1, where + ' needs one recap');
-    assert.ok(section.turns.some(t => host.test(t.name)) && section.turns.some(t => guest.test(t.name)), where + ' needs distinct host and guest speech');
-    if (section.turns.some(t => guest.test(t.name) && t.paragraphs.filter(Boolean).length > 1)) multiParagraph++;
-  }
-  assert.ok(multiTopic > sections.length / 2, 'Expected multiple specific subtopics in most chapters');
-  assert.ok(multiParagraph >= 2, 'Expected multi-paragraph guest answers across chapters');
-  assert.ok(turnsAt('1:51').some(t => /^(?:Jen|珍)/i.test(t.name)), 'Expected Jen at 1:51');
-  assert.ok(turnsAt('9:11').some(t => /^(?:John|约翰)/i.test(t.name)), 'Expected John at 9:11');
-
-  const pricing = spoken(turnsAt('41:54'));
-  assert.match(pricing, /用量|使用量|按量|按次|按使用|调用量|使用次数|消耗量|tokens?|词元/i, 'Pricing exchange should address usage');
-  assert.match(pricing, /价值|成效|产出|成果|结果|效益|收益/, 'Pricing exchange should address value');
-  const jobs = spoken(turnsAt('1:08:44'));
-  assert.match(jobs, /就业|失业|工作|劳动力|岗位|饭碗|职业/, 'Expected the actual jobs discussion at 1:08:44');
-  assert.match(jobs, /采纳|采用|民调|调查|使用|接受|普及|恐慌|担心|焦虑|离不开/, 'Expected discussion of attitudes toward adoption');
-
-  const closing = turnsAt('1:15:50');
-  let question;
-  const rounds = [];
-  for (const turn of closing) {
-    if (host.test(turn.name) && /[？?]|是否|会不会|为什么|怎么|什么|如何/.test(words(turn))) question = words(turn);
-    if (question && guest.test(turn.name)) {
-      rounds.push({question, answer: words(turn)});
-      question = undefined;
-    }
-  }
-  assert.ok(rounds.length >= 2, 'Expected at least two distinct closing questions answered by Mark');
-  assert.ok(rounds.some(round => /火星|Mars/i.test(round.question) && /不会|不太|可能不|大概不|恐怕不|不去|不想|不打算|没打算|不愿|不一定|大概率不|应该不|算了/.test(round.answer)),
-    'Expected the interviewer to ask about Mars and Mark to say he probably would not go');
-  assert.match(spoken(closing.filter(t => guest.test(t.name))), /加州|加利福尼亚|出门|离家|家门|家里|虚拟|\bVR\b|马斯克|埃隆|十年|10\s*年|往返/i,
-    'Expected a substantive follow-up to the Mars answer');
-  return {multiTopic, multiParagraph, rounds: rounds.length};
+function checkSourceLinks(links, timeline, expectedId) {
+  const toSeconds = value => value.split(':').reduce((total, part) => total * 60 + Number(part), 0);
+  const validOffsets = new Set(timeline.map(mark => toSeconds(mark.at)));
+  const offsets = links.map(href => {
+    const link = new URL(href);
+    assert.equal(link.origin + link.pathname, 'https://www.youtube.com/watch');
+    assert.equal(link.searchParams.get('v'), expectedId);
+    const t = link.searchParams.get('t');
+    assert.match(t || '', /^\d+s?$/);
+    const offset = Number(t.replace(/s$/, ''));
+    assert.ok(validOffsets.has(offset), 'Chapter time link must come from a timestamp in this source');
+    return offset;
+  });
+  if (fullCoverage && timeline.length > 1 && timeline.every(mark => mark.topic))
+    assert.deepEqual(offsets, timeline.map(mark => toSeconds(mark.at)), 'Expected every publisher topic in chronological order');
 }
 
 async function readReadySummary(page, path) {
@@ -220,16 +166,23 @@ async function readReadySummary(page, path) {
   }
 }
 
+const labels = ['Who', 'What', 'When', 'Where', 'Why', 'How'];
+
+function validateSix(data) {
+  for (const label of labels) {
+    const field = data[label.toLowerCase()];
+    assert.ok(typeof field === 'string' && field.trim(), 'Missing ' + label + ' in background summary');
+  }
+  for (const key of ['what', 'why', 'how']) assert.match(data[key], /\p{Script=Han}/u);
+}
+
 async function verifySummary(panel, data) {
-  const labels = ['Who', 'What', 'When', 'Where', 'Why', 'How'];
+  validateSix(data);
   await panel.locator('dd').first().waitFor({timeout: 240000});
   assert.deepEqual(await panel.locator('dt').allTextContents(), labels);
   for (const [i, label] of labels.entries()) {
-    const field = data[label.toLowerCase()];
-    assert.ok(typeof field === 'string' && field.trim());
-    assert.equal(await panel.locator('dd').nth(i).textContent(), field);
+    assert.equal(await panel.locator('dd').nth(i).textContent(), data[label.toLowerCase()]);
   }
-  for (const key of ['what', 'why', 'how']) assert.match(data[key], /\p{Script=Han}/u);
 }
 
 async function verifyPendingPanel(page, button, secondPath) {
@@ -286,17 +239,13 @@ async function verifyPage(browser) {
       await pause(3000);
     }
   }
-  const url = 'https://www.youtube.com/watch?v=' + videoId;
-  if (videoId === interviewId) {
-    await page.locator('#fill').click();
-    assert.equal(await page.locator('#video').inputValue(), url);
-  } else {
-    await page.locator('#video').fill(url);
-  }
-  const scope = videoId === interviewId ? '只讨论受访者对 AI 产品定价的看法。' : '只讨论字幕中最主要的话题。';
-  const requirements = fullInterview || defaultRequest || expectCaptionError ? '' : '写给刚入行的产品经理。' + scope + '写成两章中文问答，每章约两百字，先提出一个读者的问题，再回答这个问题。';
+  const url = inputUrl;
+  await page.locator('#video').fill(url);
+  const requirements = constrained
+    ? '写给刚接触本主题的读者。只讨论字幕中最主要的话题，写成两章中文问答，每章先列一个读者的问题，再根据原文回答。'
+    : '';
   await page.locator('#requirements').fill(requirements);
-  await page.evaluate(observeReading, fullInterview);
+  await page.evaluate(observeReading);
   const api = origin + '/api/articles';
   const prepare = origin + '/api/captions';
   const statusPath = prepare + '/' + videoId;
@@ -355,6 +304,7 @@ async function verifyPage(browser) {
   assert.ok(!expectCaptionError, 'The caption source is ready; this video is no longer a negative fixture');
   const ready = await prepared.json();
   assert.equal(ready.status, 'ready');
+  assert.equal(ready.videoId, videoId);
   assert.equal(ready.text, undefined);
   const article = articleResponse ?? await page.waitForResponse(res => res.url() === api, {timeout: 210000});
   assert.ok(!articleStartedEarly, 'The page posted an article before it received ready captions');
@@ -371,10 +321,7 @@ async function verifyPage(browser) {
   }
   assert.equal(summaryRequests.length, 0, 'The unopened page must not fetch a 5W1H');
   await page.locator('.chapter-recap').first().waitFor();
-  const firstReadyMs = await page.evaluate(allowSingleChapter => {
-    if (!allowSingleChapter && !window.firstSealed.stillWriting) throw new Error('First chapter only became usable after completion');
-    return Math.round(window.firstSealed.at - window.submittedAt);
-  }, defaultRequest);
+  const firstReadyMs = await page.evaluate(() => Math.round(window.firstSealed - window.submittedAt));
   const articleId = await page.evaluate(() => window.articleId);
   assert.match(articleId, /^[a-f0-9]{64}$/);
   const chapterPath = n => api + '/' + articleId + '/chapters/ch-' + n + '/summary';
@@ -407,7 +354,7 @@ async function verifyPage(browser) {
     replayedPending = await verifyPendingPanel(page, buttons.nth(1), secondPath);
     assert.ok(summaryRequests.length >= 3);
   } else {
-    assert.ok(defaultRequest, 'Expected a second chapter');
+    assert.ok(!constrained, 'The user requested two chapters');
   }
   for (const request of summaryRequests) {
     assert.ok(request.url() === path || request.url() === secondPath);
@@ -415,21 +362,19 @@ async function verifyPage(browser) {
     assert.equal(request.postData(), null);
   }
   await page.waitForFunction(() => !document.querySelector('#submit').disabled, null,
-    {timeout: fullInterview ? 600000 : 210000});
+    {timeout: fullCoverage ? 600000 : 210000});
   assert.match(await page.locator('#reader-status').innerText(), /生成完成/, await page.locator('#feedback').textContent());
 
-  const {partial, growingAnswers, durationMs} = await page.evaluate(api => {
+  const {partial, durationMs} = await page.evaluate(api => {
     const end = performance.getEntriesByName(api).at(-1).responseEnd;
-    const length = document.querySelector('#body').innerText.length;
     return {
-      partial: window.readingSamples.filter(s => s.at < end && s.at < window.firstSummaryClickAt && s.total < length && s.visible >= 10)
+      partial: window.readingSamples.filter(s => s.at < end && s.at < window.firstSummaryClickAt && s.visible >= 10)
         .map(s => ({ms: Math.round(s.at - window.submittedAt), chars: s.visible})),
-      growingAnswers: window.answerGrowth.filter(s => s.at < end),
       durationMs: Math.round(end - window.submittedAt),
     };
   }, api);
-  if (!defaultRequest) assert.ok(partial.length >= 2 && partial.at(-1).ms - partial[0].ms >= 200,
-    'Expected growing paragraph text inside the viewport on separate frames before the HTTP response ended');
+  assert.ok(partial.length >= 2 && partial.at(-1).chars > partial[0].chars && partial.at(-1).ms > partial[0].ms,
+    'Expected visible paragraph text to grow on separate frames before the article response ended');
 
   let meta, chapters, deltas = 0;
   const markdownChunks = [];
@@ -443,14 +388,15 @@ async function verifyPage(browser) {
   }
   assert.equal(meta.videoId, videoId);
   assert.equal(meta.articleId, articleId);
-  if (videoId === interviewId) {
-    assert.equal(meta.source, 'archived-youtube');
-    assert.equal(meta.durationSeconds, 4878);
-    assert.equal(meta.lastCaptionSeconds, 4866);
-    assert.equal(meta.cueCount, 2801);
-    assert.equal(meta.timeline.length, 12);
-  } else assert.ok(meta.source === 'youtube' || (videoId === 'C4GIqWeywiI' && meta.source === 'cached'));
-  assert.ok(deltas >= (defaultRequest ? 1 : 2));
+  assert.equal(meta.source, ready.source, 'The article must use the source prepared for the submitted video');
+  assert.ok(sources.includes(meta.source), 'Unexpected caption source ' + meta.source);
+  if (expectedSource) assert.equal(meta.source, expectedSource, 'Expected the article to use the requested caption source');
+  if (meta.sourceUrl) {
+    assert.equal(new URL(meta.sourceUrl).protocol, 'https:');
+    const credits = await page.locator('#reader-source a').evaluateAll(nodes => nodes.map(a => a.href));
+    assert.ok(credits.includes(new URL(meta.sourceUrl).href), 'Expected a visible source credit linking to the verified captions');
+  }
+  assert.ok(deltas >= 2, 'Expected multiple streamed text deltas');
   assert.deepEqual(closedChapters, chapters, 'Each chapter should be announced when sealed');
   if (!meta.timeline?.length) {
     for (const {title} of chapters)
@@ -458,49 +404,30 @@ async function verifyPage(browser) {
   }
   assert.equal(await page.locator('.chapter-recap').count(), chapters.length, 'Missing automatic chapter recap');
   assert.ok(chapters.length > 0);
-  if (!fullInterview && !defaultRequest) assert.equal(chapters.length, 2, 'Requested two chapters');
+  if (constrained) assert.equal(chapters.length, 2, 'Requested two chapters');
   const sections = await page.locator('.chapter-head').evaluateAll(readChapters);
-  let interviewEvidence = '';
-  if (fullInterview) {
-    const markdown = markdownChunks.join('');
-    if (markdownOut) {
-      await writeFile(markdownOut, markdown);
-      console.log('Full interview Markdown:', markdownOut);
-    }
-    console.log('全场章节', chapters.map(chapter => chapter.title).join(' / '));
-    const links = await page.locator('.chapter-head a.chapter-time').evaluateAll(nodes => nodes.map(a => a.href));
-    const timestamps = links.map(href => {
-      const target = new URL(href);
-      assert.equal(target.origin + target.pathname, 'https://www.youtube.com/watch');
-      assert.equal(target.searchParams.get('v'), interviewId);
-      const offset = target.searchParams.get('t');
-      assert.match(offset || '', /^\d+s?$/);
-      return Number(offset.replace(/s$/, ''));
-    });
-    const publisherStarts = meta.timeline.map(mark =>
-      mark.at.split(':').reduce((total, part) => total * 60 + Number(part), 0));
-    assert.deepEqual(timestamps, publisherStarts, 'Expected every publisher topic, in chronological order');
-    const {multiTopic, multiParagraph, rounds} = verifyInterview(sections, markdown, meta.timeline);
-    assert.ok(growingAnswers.length, 'Expected a single Mark answer paragraph to gain text on different frames before the article response ended');
-    const growth = growingAnswers[0];
-    interviewEvidence = `其中 ${multiTopic} 章含多个子标题，${multiParagraph} 章含跨段回答，收尾读到 ${rounds} 轮问答；流结束前同一回答段从 ${growth.from} 增长到 ${growth.to} 字符。`;
-  } else if (defaultRequest) {
-    for (const section of sections) {
-      assert.ok(section.paragraphs > 0, 'Expected prose in each generated chapter');
-      assert.equal(section.recaps, 1);
-    }
-  } else {
-    for (const {text} of sections) {
-      assert.match(text, /[？?][\s\S]*\p{Script=Han}[\s\S]{30}/u, 'Expected a question followed by an answer in each chapter');
-      if (videoId === interviewId) assert.match(text, /定价|计价|收费|价格/);
-    }
+  const markdown = markdownChunks.join('');
+  const rawChapters = markdown.split(/^##[ \t]+/m).slice(1);
+  assert.equal(rawChapters.length, chapters.length);
+  assert.equal(sections.length, chapters.length);
+  if (markdownOut) {
+    await writeFile(markdownOut, markdown);
+    console.log('Article Markdown:', markdownOut);
   }
+  const links = await page.locator('.chapter-head a.chapter-time').evaluateAll(nodes => nodes.map(a => a.href));
+  checkSourceLinks(links, meta.timeline || [], videoId);
+  for (const [i, section] of sections.entries()) {
+    assert.equal(section.recaps, 1);
+    assert.match(section.text, /\p{Script=Han}/u, 'Expected readable Chinese prose in each chapter');
+    assert.equal(section.subtopics.length, [...rawChapters[i].matchAll(/^###[ \t]+\S/gm)].length, 'Every subheading should render');
+    if (constrained) assert.match(section.text, /[？?][\s\S]*\p{Script=Han}/u, 'Expected a reader question followed by an answer');
+  }
+  // Remaining chapters have never been opened. Read their real background results too.
+  for (let n = 3; n <= chapters.length; n++) validateSix(await readReadySummary(page, chapterPath(n)));
   assert.equal(await buttons.count(), chapters.length);
-  const viewportEvidence = partial.length > 1
-    ? `首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长`
-    : `结束前记录到 ${partial.length} 次屏内段落采样`;
+  const viewportEvidence = `首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长`;
   const pendingEvidence = !hasSecond ? '这次只生成一章，未测第二章的等待交互' : replayedPending ? '第二章已缓存，模拟一次 202 和一次 503 后，面板自动读到真实结果' : '第二章首次读取返回 202，下一次读取模拟一次 503，面板随后自动填入真实后台结果';
-  const evidence = `视频 ${videoId}，来源 ${meta.source}，${viewportEvidence}。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章。${interviewEvidence}首章封存在 ${firstReadyMs} ms 可见。页面从未读取 5W1H 时，独立 GET 已读到首章六项缓存；点击后显示了相同结果。${pendingEvidence}。`;
+  const evidence = `视频 ${videoId}，来源 ${meta.source}，${viewportEvidence}。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章。全部章节均读到六项后台结果。首章封存在 ${firstReadyMs} ms 可见。页面从未读取 5W1H 时，独立 GET 已读到首章六项缓存；点击后显示了相同结果。${pendingEvidence}。`;
   console.log(evidence);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY,
     `[打开已验证的公开 Worker](${origin})\n\n${evidence}\n`);

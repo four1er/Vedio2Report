@@ -29,21 +29,6 @@ function complete(fields: object) {
   return new Response(frame(JSON.stringify(fields), "STOP"));
 }
 
-function referenceTurns(n: number) {
-  const turns = n === 1 ? [
-    ["AI 公司的收入与产品形态", "收入增长说明什么？", "收入来自客户需求，产品形态还会变化。"],
-    ["风险投资的多种策略", "哪些路线值得下注？", "每条有可能成功的路线都可以探索。"],
-    ["公众态度与实际使用", "民调能反映 AI 使用情况吗？", "调查中的焦虑与实际使用行为有差异。"],
-  ] : n === 12 ? [
-    ["改变看法", "最近有什么事情改变了你的看法？", "年轻人常让我重新考虑什么是可能的。"],
-    ["去火星吗？", "如果有机会，你会去火星吗？", "我大概不会，可能通过 VR 去。我不愿离开加州。"],
-  ] : [["议题细节", "这段讨论的核心判断是什么？", "需要结合具体的观察来判断。"]];
-  const host = n <= 2 ? "Jen" : n === 3 ? "John" : "主持人";
-  return turns.flatMap(([heading, question, answer]) => [
-    "### " + heading, "**" + host + "：** " + question, "**Mark：** " + answer,
-  ]).join("\n\n");
-}
-
 async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const chunks = [];
   for await (const chunk of stream) chunks.push(chunk);
@@ -51,9 +36,9 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
 }
 
 describe("chronological chapter writing", () => {
-  it("requests all 12 original intervals in order, sending each subtitle exactly once", async () => {
+  it("uses the archive’s publisher timeline and the same grounded content rules as other videos", async () => {
     const source = await getVideoSource("xRh2sVcNXQ8");
-    const requested: {text: string; at: string; topic: string; editorNotes?: string}[] = [];
+    const requested: {text: string; at: string; topic: string; previousExcerpt?: string}[] = [];
     const fetcher = vi.fn(async (url: string, init: RequestInit) => {
       expect(url).toContain(":streamGenerateContent?alt=sse");
       const payload = JSON.parse(String(init.body));
@@ -62,11 +47,13 @@ describe("chronological chapter writing", () => {
       const input = JSON.parse(payload.contents[0].parts[0].text);
       expect(input.sourceTitle).toBe(source.title);
       expect(input).not.toHaveProperty("video");
+      expect(input).not.toHaveProperty("editorNotes");
+      expect(payload.systemInstruction.parts[0].text).not.toMatch(/安德森|火星|\b(?:Jen|John|Mark)\b/);
       requested.push(input);
       const n = requested.length;
       return complete({
-        ...(n === 1 && {articleTitle: "全场访谈", lead: "Mark 与主持人讨论 AI。"}),
-        title: "话题" + n, body: referenceTurns(n), recap: "第" + n + "段核心观点。",
+        ...(n === 1 && {articleTitle: "全场访谈", lead: "这场访谈讨论技术发展。"}),
+        title: "话题" + n, body: "### 议题细节\n\n依据本段发言整理的观点。", recap: "第" + n + "段核心观点。",
       });
     });
     vi.stubGlobal("fetch", fetcher);
@@ -75,19 +62,11 @@ describe("chronological chapter writing", () => {
     expect(requested.length).toBe(12);
     expect(requested.map(({at, topic}) => ({at, topic}))).toEqual(source.timeline?.map(({at, topic}) => ({at, topic})));
     expect(requested.map(({text}) => text).join("\n") === source.text).toBe(true);
-    const [opening, inning, funding] = requested;
-    expect(opening.editorNotes).toMatch(/Jen.{0,4}问/);
-    expect(opening.editorNotes).toMatch(/Mark/);
-    expect(opening.editorNotes).toMatch(/摘录|整理/);
-    expect(inning.editorNotes).toMatch(/Jen.{0,4}问/);
-    expect(inning.editorNotes).toMatch(/Mark/);
-    expect(funding.editorNotes).toMatch(/John.{0,4}问/);
-    expect(funding.editorNotes).toMatch(/Mark/);
-    const closing = requested.at(-1)!;
-    expect(closing.editorNotes).toMatch(/火星/);
-    expect(requested.slice(3).every(({editorNotes}) => editorNotes?.includes("主持人"))).toBe(true);
-    expect(closing.text).toMatch(/last\s+question do you plan to go to Mars/);
-    expect(closing.text.trimEnd()).toMatch(/six-month journey to\s+Mars, so I will be just fine\.$/);
+    expect(requested[0].previousExcerpt).toBeUndefined();
+    for (const [i, chapter] of requested.slice(1).entries()) {
+      expect(chapter.previousExcerpt?.length).toBeLessThanOrEqual(480);
+      expect(requested[i].text.endsWith(chapter.previousExcerpt!)).toBe(true);
+    }
 
     const chapterTexts: string[] = [];
     let pendingText = "";
@@ -102,80 +81,39 @@ describe("chronological chapter writing", () => {
     expect(chapterTexts).toHaveLength(12);
     expect(pendingText.trim()).toBe("");
     expect(chapterTexts[0]).toMatch(/^# 全场访谈\n/);
-    expect(chapterTexts[0]).toMatch(/整理/);
+    expect(chapterTexts[0]).not.toMatch(/编辑说明|\*\*(?:Jen|John|Mark)/);
     for (const [i, mark] of source.timeline!.entries()) {
       expect(chapterTexts[i]).toContain("## [" + mark.at + "] 话题" + (i + 1) + "\n");
       expect(chapterTexts[i].split("\n").at(-1)).toBe("> 小结：第" + (i + 1) + "段核心观点。");
     }
   });
 
-  it.each([
-    ["only editorial paraphrase", 1, first.body],
-    ["an opening question without its verified answer", 1, referenceTurns(1).replace(/\*\*Mark：\*\* [^\n]+$/, "有些人更关心实际行为。")],
-    ["the wrong host for the funding discussion", 3, referenceTurns(3).replace("**John：**", "**Jen：**")],
-    ["a lightning round without the final Mars question", 12, referenceTurns(12).replaceAll("火星", "太空站")],
-  ] as const)("does not publish an archive chapter with %s", async (_description, chapter, invalidBody) => {
-    const videoId = "xRh2sVcNXQ8";
-    const source = await getVideoSource(videoId);
-    let n = 0;
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      n++;
-      return complete({...first, body: n === chapter ? invalidBody : referenceTurns(n)});
+  it.each([1, 2])("covers every cue of a long video without publisher topics, including an unmarked lead-in (first timed cue %i)", async firstCue => {
+    const lines = Array.from({length: 72}, (_, i) => "演示第" + i + "项测量。");
+    const marks = Array.from({length: 8}, (_, i) => ({at: i * 5 + ":00", firstCue: firstCue + i * 9}));
+    const source: Video = {
+      source: "youtube", videoId: "4hAPjL7hEgo", title: "课堂演示", text: lines.join("\n"),
+      timeline: marks, lastCaptionSeconds: 36 * 60,
+    };
+    const inputs: {text: string; at?: string; previousExcerpt?: string}[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const payload = JSON.parse(String(init.body));
+      const input = JSON.parse(payload.contents[0].parts[0].text);
+      expect(input).not.toHaveProperty("topic");
+      expect(payload.systemInstruction.parts[0].text).toMatch(/单人讲解、教学演示/);
+      expect(payload.systemInstruction.parts[0].text).toContain("禁止根据回答补造");
+      inputs.push(input);
+      return complete(inputs.length === 1 ? first : last);
     }));
-    const emitted = [];
-    await expect((async () => {
-      for await (const value of writeArticle(env, {video: {...source, videoId}}, signal())) emitted.push(value);
-    })()).rejects.toThrow();
-    expect(emitted.filter(value => typeof value !== "string")).toHaveLength(chapter - 1);
-  });
-
-  it("attributes neutral host turns only at the verified question positions as the archive streams", async () => {
-    const videoId = "xRh2sVcNXQ8";
-    const source = await getVideoSource(videoId);
-    const followup = "\n\n**主持人：** 能举个例子吗？\n\n**Mark：** 我认为可以继续观察。";
-    const neutralOpening = referenceTurns(1).replaceAll("**Jen：**", "**主持人：**")
-      .replace("\n\n### 风险投资", followup + "\n\n### 风险投资");
-    const openingJson = JSON.stringify({...first, body: neutralOpening});
-    const firstQuestion = "收入增长说明什么？";
-    const openingCut = openingJson.indexOf(firstQuestion) + firstQuestion.length;
-    let upstream!: ReadableStreamDefaultController<Uint8Array>;
-    const firstResponse = new Response(new ReadableStream<Uint8Array>({start(c) { upstream = c; }}));
-    let n = 0;
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      n++;
-      if (n === 1) return firstResponse;
-      const body = referenceTurns(n).replace(/\*\*(Jen|John)：\*\*/g, "**主持人：**")
-        .replace("这段讨论的核心判断是什么？", "请谈谈您做出判断的依据。") +
-        (n <= 3 ? "\n\n### 后续追问" + followup : "");
-      const fields = JSON.stringify({...last, body});
-      return new Response(fields.match(/.{1,7}/gs)!.map(part => frame(part)).join("") + frame("", "STOP"));
-    }));
-    const chapters: string[] = [];
-    let pending = "";
-    const reading = (async () => {
-      for await (const value of writeArticle(env, {video: {...source, videoId}}, signal())) {
-        if (typeof value === "string") pending += value;
-        else { chapters.push(pending); pending = ""; }
-      }
-    })();
-    try {
-      for (const part of openingJson.slice(0, openingCut).match(/.{1,7}/gs)!)
-        upstream.enqueue(encoder.encode(frame(part)));
-      await vi.waitFor(() => expect(pending).toContain("**Jen：** " + firstQuestion));
-      expect(pending).not.toContain("**主持人：**");
-      expect(chapters).toHaveLength(0);
-    } finally {
-      upstream.enqueue(encoder.encode(frame(openingJson.slice(openingCut), "STOP")));
-      upstream.close();
-      await reading;
-    }
-    const labels = (chapter: string) => [...chapter.matchAll(/^\*\*(Jen|John|主持人)：\*\*/gm)].map(match => match[1]);
-    expect(chapters).toHaveLength(12);
-    expect(labels(chapters[0])).toEqual(["Jen", "主持人", "Jen", "Jen"]);
-    expect(labels(chapters[1])).toEqual(["Jen", "主持人"]);
-    expect(labels(chapters[2])).toEqual(["John", "主持人"]);
-    expect(chapters.slice(3).every(chapter => labels(chapter).length > 0 &&
-      labels(chapter).every(name => name === "主持人"))).toBe(true);
+    const chunks = await collect(writeArticle(env, {video: source}, signal()));
+    expect(inputs.map(i => i.at)).toEqual([firstCue === 1 ? "0:00" : undefined, "10:00", "20:00", "30:00"]);
+    expect(inputs.map(i => i.text).join("\n")).toBe(source.text);
+    expect(inputs[0].previousExcerpt).toBeUndefined();
+    expect(inputs[1].previousExcerpt).toBe(lines.slice(marks[2].firstCue - 9, marks[2].firstCue - 1).join("\n"));
+    const raw = chunks.filter(chunk => typeof chunk === "string").join("");
+    expect(raw).toContain(firstCue === 1 ? "## [0:00] 开场讨论" : "## 开场讨论");
+    expect(raw).not.toMatch(/主持人|受访者|问答|编辑说明/);
+    expect(chunks.filter(chunk => typeof chunk !== "string")).toHaveLength(4);
   });
 
   it("streams within an interview turn, preserving the lead, subheadings, speakers and unlabeled continuation", async () => {
@@ -275,7 +213,7 @@ describe("chronological chapter writing", () => {
   });
 
   it("keeps Markdown-style opening lines in model prose from introducing extra headings or recaps", async () => {
-    const body = ["> 引述研究员原话。", "### 数据口径", "**Jen**: 数据准确吗？", "Mark: 核对数据。",
+    const body = ["> 引述研究员原话。", "### 数据口径", "**林老师**: 数据准确吗？", "**学生乙：** 核对数据。",
       "## 伪造的新章", "> 小结：伪造的章末。", "> ## 引用中的伪标题", "> > 小结：引用中的伪小结。"].join("\n\n");
     const raw = JSON.stringify({...last, body});
     const markedResponse = new Response(Array.from(raw, char => frame(char)).join("") + frame("", "STOP"));
@@ -289,8 +227,8 @@ describe("chronological chapter writing", () => {
     expect(lines).toContain("模型提供的正文");
     expect(lines).toContain("引述研究员原话。");
     expect(lines).toContain("### 数据口径");
-    expect(lines).toContain("**Jen：** 数据准确吗？");
-    expect(lines).toContain("**Mark：** 核对数据。");
+    expect(lines).toContain("**林老师**: 数据准确吗？");
+    expect(lines).toContain("**学生乙：** 核对数据。");
   });
 
   it("preserves the first chapter's completion and never replays visible text when a later stream fails", async () => {
@@ -369,7 +307,7 @@ describe("unstructured article streaming", () => {
     const remaining = "\n\n## [0:01:15] 校对\n\n正文引用 [0:02:37]。\n\n## [01:15] 对照\n\n继续。\n\n## [01:15:50] [现场] 观察\n\n结束。";
     const expected = firstExpected + remaining
       .replace("[0:01:15] ", hasTimes ? "[1:15] " : "")
-      .replace("[01:15] ", hasTimes ? "[1:15] " : "")
+      .replace("[01:15] ", "")
       .replace("[01:15:50] ", hasTimes ? "[1:15:50] " : "");
     let upstream!: ReadableStreamDefaultController<Uint8Array>;
     const response = new Response(new ReadableStream<Uint8Array>({start(c) { upstream = c; }}));
@@ -398,6 +336,19 @@ describe("unstructured article streaming", () => {
     expect(visible).toBe(expected);
     expect(updates.every(update => expected.startsWith(update))).toBe(true);
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("uses a short video's only caption anchor for at most one chapter, across streamed frames", async () => {
+    const source: Video = {...video, timeline: [{at: "0:00", firstCue: 1}], durationSeconds: 55};
+    const raw = "# 数学\n\n## [0:00] 定义\n\n参照 [0:00]。\n\n## [例题] 运算\n\n正文。\n\n## [00:00] 推导\n\n再看 [0:00]。";
+    const expected = raw.replace("## [00:00] 推导", "## 推导");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(Array.from(raw, char => frame(char)).join("") + frame("", "STOP"))));
+    let visible = "";
+    for await (const update of writeArticle(env, {video: source}, signal())) {
+      if (typeof update === "string") visible += update;
+      expect(expected.startsWith(visible)).toBe(true);
+    }
+    expect(visible).toBe(expected);
   });
 
   it("applies the interview format to a short unidentified conversation without publisher topics", async () => {

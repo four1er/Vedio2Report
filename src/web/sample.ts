@@ -1,6 +1,12 @@
 import type { Chapter } from './reader';
 import type { Summary } from './summary';
 
+export const sampleSource = {
+  source: 'archived-youtube',
+  videoId: 'xRh2sVcNXQ8',
+  title: '马克·安德森访谈',
+  timeline: [{at: '1:51'}, {at: '9:11'}],
+};
 export const sampleChapters: Chapter[] = [
   { id: 'ch-1', title: '[1:51] AI 革命走到哪一步了？' },
   { id: 'ch-2', title: '[9:11] AI 公司的收入从哪里来？' },
@@ -8,13 +14,13 @@ export const sampleChapters: Chapter[] = [
 
 export const sampleMarkdown = `# AI 才刚开场，收入从哪里来？
 
-这两段问答选自马克·安德森的 2026 展望访谈。以下根据英文字幕节译，省略了口头重复和部分例子。
+以下是马克·安德森访谈的编辑节译。两个章节按发布者标记的话题时间定位，省略了部分例子和口头重复。
 
 ## [1:51] AI 革命走到哪一步了？
 
 ### 一场始于八十年前的实验
 
-**Jen：** 如果把 AI 革命比作一场棒球赛，你觉得现在打到第几局了？什么最让你兴奋？
+**主持人：** 我们正处在 AI 革命之中。Mark，你觉得现在打到第几局了？什么最让你兴奋？
 
 **Mark：** 这是我一生中经历过的最大一场技术革命。要找同等量级的发明，我想到的是微处理器、蒸汽机和电力。
 
@@ -32,7 +38,7 @@ export const sampleMarkdown = `# AI 才刚开场，收入从哪里来？
 
 ### 消费产品已经有了分发网络
 
-**John：** 大家常提一个问题，AI 公司的收入确实很可观，可开支好像也在同步增长。这场讨论漏掉了什么？
+**主持人：** 大家常提一个问题，AI 公司的收入确实很可观，可开支好像也在同步增长。这场讨论漏掉了什么？
 
 **Mark：** 我会先看两种生意，一种面向消费者，另一种面向企业。先说消费者。做互联网的时候，我们得先铺光纤、建基站，把手机和电脑送到人们手里。第一代 iPhone 用的还是 2G 网络。
 
@@ -48,7 +54,7 @@ export const sampleMarkdown = `# AI 才刚开场，收入从哪里来？
 
 export const sampleSummaries: Record<string, Summary> = {
   'ch-1': {
-    who: 'Jen 提问，马克·安德森（Mark）回答。',
+    who: '主持人提问，马克·安德森（Mark）回答。',
     what: '安德森把 AI 放在计算史中，判断目前仍处于早期。',
     when: '他从上世纪三十年代的计算机讨论谈到 1943 年的神经网络论文和 2022 年底的 ChatGPT。',
     where: '研究发生在学术界和创业公司，访谈未提及录制地点。',
@@ -56,7 +62,7 @@ export const sampleSummaries: Record<string, Summary> = {
     how: '并看底层研究、新产品和实际到账的收入，判断技术进展与市场采用情况。',
   },
   'ch-2': {
-    who: 'John 提问，马克·安德森（Mark）回答。',
+    who: '主持人提问，马克·安德森（Mark）回答。',
     what: '从消费者和企业两类客户解释 AI 公司的收入与需求。',
     when: '互联网基础设施已经普及、AI 产品可以直接面向用户分发时。',
     where: '消费者通过移动互联网下载产品，企业在客服、销售和客户留存等环节使用 AI。',

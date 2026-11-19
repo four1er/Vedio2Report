@@ -79,6 +79,7 @@ export class ArticleSession {
   private async *generate(video: Video, requirements: string, signal: AbortSignal): AsyncGenerator<StreamEvent> {
     yield ['meta', {
       articleId: this.state.id.toString(), videoId: video.videoId, source: video.source, title: video.title,
+      sourceUrl: video.sourceUrl, sourceLabel: video.sourceLabel,
       durationSeconds: video.durationSeconds, lastCaptionSeconds: video.lastCaptionSeconds, cueCount: video.cueCount,
       timeline: video.timeline?.map(({at, topic}) => ({at, topic})),
     }]

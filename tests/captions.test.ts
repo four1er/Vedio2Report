@@ -27,6 +27,8 @@ describe("YouTube URLs", () => {
     `https://m.youtube.com/shorts/${otherId}`,
     `https://youtube.com/live/${otherId}`,
     `https://www.youtube.com/embed/${otherId}`,
+    `https://www.youtube-nocookie.com/embed/${otherId}`,
+    `https://music.youtube.com/watch?v=${otherId}`,
   ])("recognizes %s", url => expect(parseVideoId(url)).toBe(otherId));
 
   it.each([
@@ -37,6 +39,7 @@ describe("YouTube URLs", () => {
     `https://youtu.be:444/${otherId}`,
     `https://youtu.be/${otherId}/tail`,
     "https://www.youtube.com/watch?v=too-short",
+    `https://www.youtube.com/watch?v=${otherId}&v=${referenceVideoId}`,
   ])("rejects %s", url => expect(() => parseVideoId(url)).toThrow());
 });
 
@@ -125,7 +128,7 @@ describe("caption acquisition", () => {
 
   it("rejects an oversized live transcript without sending it to Gemini", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
-      Response.json({events: [{segs: [{utf8: "文".repeat(34_000)}]}]}),
+      Response.json({events: [{segs: [{utf8: "文".repeat(171_000)}]}]}),
     ));
     await expect(getVideoSource(otherId)).rejects.toMatchObject({code: "PERMANENT", message: expect.stringContaining("字幕过长")});
   });
@@ -207,7 +210,7 @@ it("preserves a genuine licensed transcript for the W3C video when YouTube is un
 
 it("counts non-BMP caption characters as four UTF-8 bytes", async () => {
   vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(watchPage(otherId)).mockResolvedValueOnce(
-    Response.json({events: [{segs: [{utf8: "🔔".repeat(25_001)}]}]}),
+    Response.json({events: [{segs: [{utf8: "🔔".repeat(128_001)}]}]}),
   ));
   await expect(getVideoSource(otherId)).rejects.toThrow("字幕过长");
 });
@@ -282,5 +285,42 @@ describe("YouTube watch redirects", () => {
       Promise.resolve(redirect("/watch?v=" + otherId + "&hop=" + (Number(url.searchParams.get("hop")) + 1))));
     await expect(getVideoSource(otherId)).rejects.toThrow("跳转次数过多");
     expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("public source fallback for unrelated videos", () => {
+  const options = {SUPADATA_API_KEY: "unit-test-key"};
+  const challenge = () => Response.redirect("https://www.google.com/sorry/index", 302);
+
+  it.each(["alphanumb01", "2-unrelat_d"])("reads only the requested video's existing track through the configured provider (%s)", async id => {
+    const subtitle = "Caption for " + id;
+    const fetcher = vi.fn().mockResolvedValueOnce(challenge()).mockResolvedValueOnce(Response.json({
+      videoId: id, lang: "en", content: [{text: subtitle, offset: 1000, duration: 4000}],
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    const discovery = await discoverCaptions(id, options);
+    const source = await downloadCaptions(discovery, options);
+    expect(source).toMatchObject({text: subtitle, source: "native-api", cueCount: 1, lastCaptionSeconds: 5});
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const provider = new URL(fetcher.mock.calls[1][0]);
+    expect(provider.searchParams.get("url")).toBe("https://www.youtube.com/watch?v=" + id);
+    expect(provider.searchParams.get("mode")).toBe("native");
+  });
+
+  it.each([
+    [{playabilityStatus: {status: "OK"}, videoDetails: {videoId: otherId}}, "NO_CAPTIONS"],
+    [{playabilityStatus: {status: "LOGIN_REQUIRED"}}, "SOURCE_UNVERIFIED"],
+    [{playabilityStatus: {status: "UNPLAYABLE"}}, "SOURCE_UNVERIFIED"],
+  ] as const)("stops before third-party lookup when the player confirms no track or restricted playback", async (player, code) => {
+    const fetcher = vi.fn().mockResolvedValue(new Response("var ytInitialPlayerResponse = " + JSON.stringify(player)));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(discoverCaptions(otherId, options)).rejects.toMatchObject({code});
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("preserves uncertainty if both the challenged player and provider cannot supply this video", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(challenge())
+      .mockResolvedValueOnce(Response.json({error: "transcript-unavailable"}, {status: 206})));
+    await expect(discoverCaptions(otherId, options)).rejects.toMatchObject({code: "SOURCE_UNVERIFIED"});
   });
 });

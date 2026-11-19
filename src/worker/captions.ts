@@ -1,32 +1,12 @@
 import { cachedCaptions, cachedVideoId } from "./sample";
 import interview from "./archives/xRh2sVcNXQ8.json";
-import { ApiError } from "./protocol";
-
-const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
-const youtubeHosts = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]);
-const invalidLink = "请输入有效的 YouTube 视频链接，例如 youtube.com/watch?v=… 或 youtu.be/…。";
-export type CaptionErrorCode = "NO_CAPTIONS" | "SOURCE_UNVERIFIED" | "TEMPORARY" | "PERMANENT";
-export class CaptionSourceError extends ApiError {
-  constructor(readonly code: CaptionErrorCode, message: string, status = code === "TEMPORARY" ? 503 : 422) {
-    super(status, message);
-  }
-}
-
-function unavailable(reason: string, code: CaptionErrorCode = "SOURCE_UNVERIFIED"): CaptionSourceError {
-  return new CaptionSourceError(code, "YouTube 未返回可读取的字幕。" + reason);
-}
-
-interface CaptionMark {at: string; firstCue: number; topic?: string}
-export interface Source {
-  source: "youtube" | "cached" | "archived-youtube";
-  title: string;
-  text: string;
-  durationSeconds?: number;
-  lastCaptionSeconds?: number;
-  cueCount?: number;
-  timeline?: CaptionMark[];
-}
-export type Video = Source & {videoId: string};
+import { CaptionSourceError, unavailable, videoIdPattern, invalidLink, youtubeHosts, sourceFromCues } from "./caption-source";
+import type { Source } from "./caption-source";
+export { CaptionSourceError, parseVideoId } from "./caption-source";
+export type { CaptionErrorCode, Source, Video } from "./caption-source";
+import { discoverNative, pollNative, type NativeTrack } from "./native-captions";
+import { discoverPublished, downloadPublished, type PublishedDiscovery } from "./published-captions";
+import type { Bindings } from "./protocol";
 
 // Server-only: signed URLs are valid for limited time and must never be sent to the client.
 interface LiveDiscovery {
@@ -36,28 +16,17 @@ interface LiveDiscovery {
   durationSeconds?: number;
   trackUrls: string[];
 }
-export type CaptionDiscovery = LiveDiscovery | {kind: "archive"; videoId: string; title: string};
-
-export function parseVideoId(input: string): string {
-  let url: URL;
-  try {
-    url = new URL(input);
-  } catch {
-    throw new Error(invalidLink);
-  }
-  if (!["https:", "http:"].includes(url.protocol) || url.port || url.username || url.password) {
-    throw new Error(invalidLink);
-  }
-  let id: string | undefined;
-  if (url.hostname === "youtu.be") {
-    id = /^\/([^/]+)\/?$/.exec(url.pathname)?.[1];
-  } else if (youtubeHosts.has(url.hostname)) {
-    id = url.pathname === "/watch" ? url.searchParams.get("v") ?? undefined :
-      /^\/(?:shorts|embed|live)\/([^/]+)\/?$/.exec(url.pathname)?.[1];
-  }
-  if (!id || !videoIdPattern.test(id)) throw new Error(invalidLink);
-  return id;
+type CaptionOptions = Pick<Bindings, "SUPADATA_API_KEY">;
+export interface NativeJobDiscovery {
+  kind: "native-job";
+  videoId: string;
+  title: string;
+  jobId: string;
+  deadline: number;
+  playerError: string;
 }
+export type CaptionDiscovery = LiveDiscovery | NativeJobDiscovery | {kind: "archive"; videoId: string; title: string} |
+  PublishedDiscovery | {kind: "native"; videoId: string; title: string; source: Source};
 
 interface CaptionTrack {
   baseUrl: string;
@@ -121,9 +90,9 @@ function watchRedirect(location: string | null, from: URL, videoId: string): URL
     throw unavailable("观看页跳转地址不符合公开播放页格式。");
   const host = next.hostname;
   if (host === "consent.youtube.com" || host === "consent.google.com")
-    throw unavailable("YouTube 将观看页转到了同意设置页面。");
+    throw unavailable("YouTube 将观看页转到了同意设置页面。", "SOURCE_UNVERIFIED", true);
   if (host === "accounts.google.com" || (youtubeHosts.has(host) && next.pathname === "/signin"))
-    throw unavailable("YouTube 将观看页转到了登录页面。");
+    throw unavailable("YouTube 将观看页转到了登录页面。", "SOURCE_UNVERIFIED", true);
   if ((youtubeHosts.has(host) || host === "www.google.com" || host === "google.com") &&
       /^\/sorry(?:\/|$)/.test(next.pathname))
     throw unavailable("YouTube 将观看页转到了 Google 流量验证页面。");
@@ -157,17 +126,6 @@ async function readWatchPage(videoId: string, signal: AbortSignal): Promise<stri
 function rank(track: CaptionTrack): number {
   const lang = typeof track.languageCode === "string" ? track.languageCode.split("-")[0] : undefined;
   return (track.kind === "asr" ? 4 : 0) + (lang === "zh" ? 0 : lang === "en" ? 1 : 2);
-}
-
-function clockTime(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  const remainder = String(seconds % 60).padStart(2, "0");
-  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${remainder}` : `${minutes}:${remainder}`;
-}
-
-function validMs(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function verifiedTrackUrl(baseUrl: string, videoId: string): URL | undefined {
@@ -225,8 +183,8 @@ async function discoverLive(videoId: string): Promise<LiveDiscovery> {
   const html = await readWatchPage(videoId, AbortSignal.timeout(10000));
   const player = playerFromHtml(html);
   const status = player.playabilityStatus?.status;
-  if (status === "LOGIN_REQUIRED") throw unavailable("播放器要求登录后才能访问该视频。");
-  if (status && status !== "OK") throw unavailable("播放器当前无法公开播放该视频。");
+  if (status === "LOGIN_REQUIRED") throw unavailable("播放器要求登录后才能访问该视频。", "SOURCE_UNVERIFIED", true);
+  if (status && status !== "OK") throw unavailable("播放器当前无法公开播放该视频。", "SOURCE_UNVERIFIED", true);
   if (player.videoDetails?.videoId !== videoId) throw unavailable("观看页没有提供与链接匹配的视频信息。");
   const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!Array.isArray(tracks) || !tracks.length) {
@@ -249,60 +207,75 @@ async function discoverLive(videoId: string): Promise<LiveDiscovery> {
   return discovery;
 }
 
-async function downloadLive(discovery: LiveDiscovery): Promise<Source> {
-  const cues = await readTracks(discovery, AbortSignal.timeout(10000));
-  const text = cues.map(cue => cue.text).join("\n");
-  if (new TextEncoder().encode(text).byteLength > 100_000)
-    throw new CaptionSourceError("PERMANENT", "字幕过长，请选择字幕在 100 KB 以内的视频。");
-  const result: Source = {text, title: discovery.title, source: "youtube", cueCount: cues.length};
-  if (discovery.durationSeconds !== undefined) result.durationSeconds = discovery.durationSeconds;
-  const last = cues[cues.length - 1];
-  if (validMs(last.start) && validMs(last.duration)) {
-    const end = Math.floor((last.start + last.duration) / 1000);
-    if (result.durationSeconds === undefined || end <= result.durationSeconds) result.lastCaptionSeconds = end;
-  }
-  // Bound the metadata even for unusually long or discontinuous caption tracks.
-  const latestMs = cues.reduce((latest, cue) => validMs(cue.start) ? Math.max(latest, cue.start) : latest, 0);
-  const spacing = Math.max(300_000, Math.ceil(latestMs / 32));
-  const marks: CaptionMark[] = [];
-  let nextMs = 0;
-  for (const [i, cue] of cues.entries()) {
-    if (validMs(cue.start) && cue.start >= nextMs) {
-      marks.push({at: clockTime(Math.floor(cue.start / 1000)), firstCue: i + 1});
-      nextMs = cue.start + spacing;
-    }
-  }
-  if (marks.length) result.timeline = marks;
-  return result;
+function nativeSource(track: NativeTrack, title: string) {
+  return sourceFromCues(track.cues, {source: "native-api", title, sourceLabel: "Supadata 原生字幕"});
 }
 
-export async function discoverCaptions(videoId: string): Promise<CaptionDiscovery> {
+async function alternateSource(videoId: string, error: unknown, options: CaptionOptions, title?: string): Promise<CaptionDiscovery> {
+  const original = sourceFailure(error, "暂时无法连接到 YouTube，请稍后重试。");
+  if (original.restricted || original.code === "NO_CAPTIONS" || original.code === "PERMANENT") throw original;
+  const publication = discoverPublished(videoId);
+  if (publication) return publication;
+  if (!options.SUPADATA_API_KEY?.trim()) throw original;
+  try {
+    const track = await discoverNative(videoId, options.SUPADATA_API_KEY);
+    const videoTitle = title || "YouTube 视频 " + videoId;
+    if ("jobId" in track) return {
+      kind: "native-job", videoId, title: videoTitle, jobId: track.jobId, deadline: Date.now() + 3_600_000,
+      playerError: original.message,
+    };
+    return {kind: "native", videoId, title: videoTitle, source: nativeSource(track, videoTitle)};
+  } catch (fallback) {
+    // A provider's lack of a transcript cannot prove that a challenged player has no tracks.
+    if (fallback instanceof CaptionSourceError && fallback.code === "NO_CAPTIONS") throw original;
+    throw sourceFailure(fallback, "备用字幕服务暂时不可用。");
+  }
+}
+
+export async function discoverCaptions(videoId: string, options: CaptionOptions = {}): Promise<CaptionDiscovery> {
   if (!videoIdPattern.test(videoId)) throw new CaptionSourceError("PERMANENT", invalidLink, 400);
   if (videoId === interview.videoId) return {kind: "archive", videoId, title: interview.title};
   try {
     return await discoverLive(videoId);
   } catch (error) {
     if (videoId === cachedVideoId) return {kind: "archive", videoId, title: cachedCaptions.title};
-    throw sourceFailure(error, "暂时无法连接到 YouTube，请稍后重试。");
+    return alternateSource(videoId, error, options);
   }
 }
 
-export async function downloadCaptions(discovery: CaptionDiscovery): Promise<Source> {
+export async function downloadCaptions(discovery: CaptionDiscovery, options: CaptionOptions = {}): Promise<Source | NativeJobDiscovery> {
   const {videoId} = discovery;
   if (!videoIdPattern.test(videoId)) throw new CaptionSourceError("PERMANENT", invalidLink, 400);
+  if (discovery.kind === "native-job") {
+    try {
+      const track = await pollNative(videoId, discovery.jobId, options.SUPADATA_API_KEY ?? "");
+      return track ? nativeSource(track, discovery.title) : discovery;
+    } catch (error) {
+      if (error instanceof CaptionSourceError && error.code === "NO_CAPTIONS")
+        throw new CaptionSourceError("SOURCE_UNVERIFIED", discovery.playerError);
+      throw error;
+    }
+  }
+  if (discovery.kind === "native") return discovery.source;
+  if (discovery.kind === "published") return downloadPublished(discovery);
   if (discovery.kind === "archive") {
     if (videoId === interview.videoId) return {...interview, source: "archived-youtube"};
     if (videoId === cachedVideoId) return cachedCaptions;
     throw unavailable("没有与该视频 ID 匹配的字幕存档。", "PERMANENT");
   }
   try {
-    return await downloadLive(discovery);
+    const cues = await readTracks(discovery, AbortSignal.timeout(10000));
+    return sourceFromCues(cues, {source: "youtube", title: discovery.title, durationSeconds: discovery.durationSeconds});
   } catch (error) {
     if (videoId === cachedVideoId) return cachedCaptions;
-    throw sourceFailure(error, "暂时无法下载 YouTube 字幕，请稍后重试。");
+    const fallback = await alternateSource(videoId, error, options, discovery.title);
+    // Persist the returned handle before the first status request goes on the network.
+    return fallback.kind === "native-job" ? fallback : downloadCaptions(fallback, options);
   }
 }
 
 export async function getVideoSource(videoId: string): Promise<Source> {
-  return downloadCaptions(await discoverCaptions(videoId));
+  const result = await downloadCaptions(await discoverCaptions(videoId));
+  if ("kind" in result) throw unavailable("字幕服务仍在检查该视频。", "TEMPORARY");
+  return result;
 }

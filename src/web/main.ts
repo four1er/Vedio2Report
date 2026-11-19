@@ -3,7 +3,7 @@ import { applyIcons } from './icons';
 import { createArticleRenderer, timestampSeconds, type Chapter } from './reader';
 import { events, responseError, waitForRetry } from './stream';
 import { loadSummary } from './summary';
-import { sampleMarkdown, sampleChapters, sampleSummaries } from './sample';
+import { sampleMarkdown, sampleChapters, sampleSummaries, sampleSource } from './sample';
 
 applyIcons();
 function element<T extends HTMLElement = HTMLElement>(id: string) {
@@ -68,8 +68,7 @@ function showSample() {
   openResult(true);
   markdown = sampleMarkdown;
   const links = new Map<number, string>();
-  displaySource({source: 'archived-youtube', videoId: 'xRh2sVcNXQ8', title: '马克·安德森访谈原片',
-    timeline: [{at: '1:51'}, {at: '9:11'}]}, links);
+  displaySource(sampleSource, links);
   source.append(' · 两章问答与 5W1H 均为预置样稿');
   const render = createArticleRenderer(body, title, async id => sampleSummaries[id], links, readerLifetime.signal);
   render(markdown, sampleChapters);
@@ -79,9 +78,9 @@ element('sample').addEventListener('click', showSample);
 navSample.addEventListener('click', event => { event.preventDefault(); showSample(); });
 navStudio.addEventListener('click', () => { switchNav(false); input.focus({ preventScroll: true }); });
 element('fill').addEventListener('click', () => {
-  input.value = 'https://www.youtube.com/watch?v=xRh2sVcNXQ8';
+  input.value = 'https://www.youtube.com/watch?v=' + sampleSource.videoId;
   input.setCustomValidity('');
-  element('url-hint').textContent = '已填入马克·安德森访谈，原片时长 1 小时 21 分 18 秒。';
+  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可试写。';
   tell('');
   input.focus();
 });
@@ -101,17 +100,21 @@ function setBusy(busy: boolean) {
   stop.textContent = busy ? '取消' : '停止生成';
 }
 function sourceName(kind: string, downloaded?: boolean) {
-  if (kind === 'cached') return 'W3C WAI 官方存档字幕';
-  if (kind === 'archived-youtube') return 'YouTube 英文字幕存档 · 服务端已预先下载';
+  if (kind === 'cached') return 'W3C WAI 官方逐字稿';
+  if (kind === 'archived-youtube') return 'YouTube 字幕存档';
+  if (kind === 'published-captions') return '公开发布的字幕';
+  if (kind === 'native-api') return '第三方服务提供的 YouTube 字幕';
   if (kind === 'youtube' && downloaded !== undefined) {
     return downloaded ? 'YouTube 视频字幕 · 已完整下载' : 'YouTube 视频字幕 · 已读取服务端下载缓存';
   }
-  return 'YouTube 视频字幕';
+  return kind === 'youtube' ? 'YouTube 视频字幕' : '视频字幕';
 }
 interface SourceMeta {
   source: string;
   videoId: string;
   title?: string;
+  sourceUrl?: string;
+  sourceLabel?: string;
   durationSeconds?: number;
   lastCaptionSeconds?: number;
   cueCount?: number;
@@ -130,10 +133,11 @@ async function prepareCaptions(url: string, signal: AbortSignal) {
     const data = await response.json();
     if (!data || !/^[a-zA-Z0-9_-]{11}$/.test(data.videoId)) throw new Error('字幕状态无效，请重新检查。');
     if (response.status === 200 && data.status === 'ready') return {source: data as SourceMeta, downloaded};
-    if (response.status !== 202 || !['pending', 'running'].includes(data.status)) throw new Error('字幕状态无效，请重新检查。');
+    if (response.status !== 202 || !['checking', 'pending', 'running'].includes(data.status)) throw new Error('字幕状态无效，请重新检查。');
     downloaded = true;
     element('submit-caption').textContent = '准备字幕中…';
-    status.textContent = data.status === 'pending' ? '已确认有字幕，正在等待下载…' : '已确认有字幕，正在下载完整字幕文件…';
+    if (data.status === 'checking') status.textContent = '正在等待字幕服务确认该视频是否有可读字幕…';
+    else status.textContent = data.status === 'pending' ? '已确认有字幕，正在等待下载…' : '已确认有字幕，正在下载完整字幕文件…';
     await waitForRetry(response.headers.get('Retry-After'), signal);
     response = await fetch('/api/captions/' + data.videoId, {signal, cache: 'no-store'});
     if (response.status === 404 && !rechecked) {
@@ -155,6 +159,19 @@ function timecode(seconds: number) {
 
 function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?: boolean) {
   source.textContent = sourceName(meta.source, downloaded);
+  if (meta.source === 'published-captions') {
+    const label = meta.sourceLabel?.trim();
+    let sourceUrl: URL | undefined;
+    if (meta.sourceUrl && URL.canParse(meta.sourceUrl)) sourceUrl = new URL(meta.sourceUrl);
+    if (sourceUrl?.protocol === 'https:' && !sourceUrl.username && !sourceUrl.password) {
+      const credit = document.createElement('a');
+      credit.href = sourceUrl.href;
+      credit.target = '_blank';
+      credit.rel = 'noopener noreferrer';
+      credit.textContent = label || '字幕来源';
+      source.append(' · ', credit);
+    } else if (label) source.append(' · ', label);
+  }
   topics.replaceChildren();
   links.clear();
   const video = /^[a-zA-Z0-9_-]{11}$/.test(meta.videoId) ? 'https://www.youtube.com/watch?v=' + meta.videoId : '';

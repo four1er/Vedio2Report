@@ -5,7 +5,7 @@ import type { Bindings } from './protocol'
 
 const cacheLifetime = 24 * 60 * 60_000
 const failureLifetime = 30_000
-const downloadLease = 30_000
+const downloadLease = 60_000
 const maxAttempts = 3
 
 type Download = {
@@ -23,6 +23,17 @@ function finished(record: Record): record is Finished {
   return record.status === 'ready' || record.status === 'failed'
 }
 
+function pending(discovery: CaptionDiscovery): Download {
+  return {status: 'pending', discovery, token: crypto.randomUUID(), attempt: 0, wakeAt: Date.now()}
+}
+
+function reschedule(record: Download): Download {
+  // Status reads of the same provider job are free. Poll more slowly as it ages.
+  const job = record.discovery.kind === 'native-job' ? record.discovery : undefined
+  const delay = 1000 * 2 ** Math.min(5, Math.max(0, record.attempt - 1))
+  return {...record, status: 'pending', wakeAt: Math.min(Date.now() + delay, job?.deadline ?? Infinity)}
+}
+
 function ready(source: Source): Finished {
   if (!source.text.trim()) throw new CaptionSourceError('TEMPORARY', '字幕轨已找到，但下载结果为空，请稍后再试。')
   return {status: 'ready', source, expiresAt: Date.now() + cacheLifetime}
@@ -37,16 +48,18 @@ function present(record: Record, videoId: string, includeText: boolean): Respons
   if (record.status === 'failed') throw new CaptionSourceError(record.code, record.message, record.httpStatus)
   if (record.status === 'ready') {
     if (includeText) return json(record.source)
-    const {title, source, cueCount, durationSeconds, lastCaptionSeconds} = record.source
-    return json({status: 'ready', videoId, title, source, cueCount, durationSeconds, lastCaptionSeconds})
+    const {title, source, sourceUrl, sourceLabel, cueCount, durationSeconds, lastCaptionSeconds} = record.source
+    return json({status: 'ready', videoId, title, source, sourceUrl, sourceLabel, cueCount, durationSeconds, lastCaptionSeconds})
   }
-  return json({status: record.status, videoId, title: record.discovery.title}, 202, {'Retry-After': '1'})
+  const checking = record.discovery.kind === 'native-job'
+  const wait = checking && record.status === 'pending' ? Math.max(1, Math.ceil((record.wakeAt - Date.now()) / 1000)) : 1
+  return json({status: checking ? 'checking' : record.status, videoId, title: record.discovery.title}, 202, {'Retry-After': String(wait)})
 }
 
 // Every video has one named object. Network I/O runs outside storage transactions.
 export class CaptionCache {
   private discovery?: Promise<Record>
-  constructor(private readonly state: DurableObjectState) {}
+  constructor(private readonly state: DurableObjectState, private readonly env: Pick<Bindings, 'SUPADATA_API_KEY'> = {}) {}
 
   async fetch(request: Request): Promise<Response> {
     try {
@@ -73,11 +86,10 @@ export class CaptionCache {
   private async start(videoId: string): Promise<Record> {
     const existing = await this.active()
     if (existing) return existing
-    const discovery = await discoverCaptions(videoId)
-    // An inaccessible player or missing track throws before any task is written.
-    const record: Record = discovery.kind === 'archive'
-      ? ready(await downloadCaptions(discovery))
-      : {status: 'pending', discovery, token: crypto.randomUUID(), attempt: 0, wakeAt: Date.now()}
+    const discovery = await discoverCaptions(videoId, this.env)
+    // A native 202 saves the provider handle first. It has not confirmed a track yet.
+    const result = discovery.kind === 'archive' || discovery.kind === 'native' ? await downloadCaptions(discovery, this.env) : discovery
+    const record = 'kind' in result ? pending(result) : ready(result)
     await this.state.storage.transaction(tx => save(tx, record))
     return record
   }
@@ -92,14 +104,20 @@ export class CaptionCache {
         return
       }
       if (record.wakeAt > Date.now()) { await tx.setAlarm(record.wakeAt); return }
-      if (record.attempt >= maxAttempts) {
+      if (record.discovery.kind === 'native-job' && record.discovery.deadline <= Date.now()) {
+        await save(tx, {status: 'failed', code: 'TEMPORARY', httpStatus: 503,
+          message: '字幕服务在一小时内仍未返回可读字幕，本次检查已超时。', expiresAt: Date.now() + cacheLifetime})
+        return
+      }
+      if (record.discovery.kind !== 'native-job' && record.attempt >= maxAttempts) {
         await save(tx, {status: 'failed', code: 'TEMPORARY', httpStatus: 503,
           message: '字幕下载多次中断，请稍后重新检查。', expiresAt: Date.now() + failureLifetime})
         return
       }
       record.status = 'running'
       record.attempt++
-      record.wakeAt = Date.now() + downloadLease
+      record.wakeAt = Math.min(Date.now() + downloadLease,
+        record.discovery.kind === 'native-job' ? record.discovery.deadline : Infinity)
       await save(tx, record)
       return record
     })
@@ -107,14 +125,19 @@ export class CaptionCache {
 
     let next: Record
     try {
-      // A signed timedtext URL can expire between attempts.
-      const source = claim.attempt === 1 ? claim.discovery : await discoverCaptions(claim.discovery.videoId)
-      next = ready(await downloadCaptions(source))
+      // Refresh expiring signed YouTube URLs. A persisted provider handle is always
+      // polled directly, even on a redelivered alarm or a transient network error.
+      const refresh = claim.discovery.kind === 'live' && claim.attempt > 1
+      const source = refresh ? await discoverCaptions(claim.discovery.videoId, this.env) : claim.discovery
+      const result = refresh && source.kind === 'native-job' ? source : await downloadCaptions(source, this.env)
+      if (!('kind' in result)) next = ready(result)
+      else if (claim.discovery.kind === 'native-job') next = reschedule(claim)
+      else next = pending(result)
     } catch (error) {
       const reason = error instanceof CaptionSourceError ? error :
         new CaptionSourceError('TEMPORARY', '暂时无法下载字幕，请稍后再试。')
-      if (reason.code === 'TEMPORARY' && claim.attempt < maxAttempts)
-        next = {...claim, status: 'pending', wakeAt: Date.now() + 1000 * 2 ** (claim.attempt - 1)}
+      if (reason.code === 'TEMPORARY' && (claim.discovery.kind === 'native-job' || claim.attempt < maxAttempts))
+        next = reschedule(claim)
       else next = {status: 'failed', code: reason.code, message: reason.message,
         httpStatus: reason.status, expiresAt: Date.now() + failureLifetime}
     }

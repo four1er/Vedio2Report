@@ -9,6 +9,7 @@ export interface Bindings {
   ARTICLES: DurableObjectNamespace
   ASSETS: Fetcher
   GEMINI_API_KEY?: string
+  SUPADATA_API_KEY?: string
   GEMINI_MODEL?: string
   GENERATION_LIMIT?: { limit(options: {key: string}): Promise<{success: boolean}> }
 }
