@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { ArticleSession } from "../src/worker/index";
 import { preparedSource } from "../src/worker/caption-cache";
 import { ApiError } from "../src/worker/protocol";
+import * as gemini from "../src/worker/gemini";
 import { chapterRecapText } from "../src/shared/chapter-recap";
 
 vi.mock("../src/worker/caption-cache", async (importOriginal) => ({
@@ -11,6 +12,7 @@ vi.mock("../src/worker/caption-cache", async (importOriginal) => ({
 }));
 
 const url = "https://www.youtube.com/watch?v=xRh2sVcNXQ8";
+const scopedRequirements = "只总结海洋监测。";
 const transcript = "字幕上下文：主持人介绍观测站，研究员解释海水温度。";
 const firstPart = "# 海洋对话\n\n## 观测站\n\n主持人介绍海上的观测站。\n\n> 小结：观测站设在海上。";
 const secondBody = "研究员分享温度记录。\n\n> **小结:** 记录展示海水温度变化。";
@@ -121,10 +123,15 @@ describe("Worker article workflow", () => {
         expect(material.summary.what).toBe("Ocean monitoring");
         return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
       }
+      if (req.url.includes(":streamGenerateContent")) {
+        expect(material.units.map((unit: {text: string}) => unit.text)).toEqual([transcript]);
+        const response = {articleTitle: "海洋对话", chapterTitle: "观测站",
+          units: [{id: material.units[0].id, heading: "观测站介绍", speaker: "主持人", text: transcript}]};
+        return new Response(geminiFrame(JSON.stringify(response), "STOP"));
+      }
       expect(material.video.segments).toEqual([{at: "00:00:00", topic: "开场", text: transcript}]);
       expect(material.video.text).toBeUndefined();
-      if (req.url.includes(":streamGenerateContent")) return new Response(geminiFrame(firstPart, "STOP"));
-      expect(material.chapter.title).toBe("观测站");
+      expect(material.chapter.title).toMatch(/观测站$/);
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify({...summary, what: "Ocean monitoring"})}]}, finishReason: "STOP"}]});
     });
     const events = readEvents(await app.post("/api/articles", {url}));
@@ -133,9 +140,21 @@ describe("Worker article workflow", () => {
     expect(meta.data).toMatchObject({durationSeconds: 4878, lastCaptionSeconds: 4866, cueCount: 2801});
     expect(meta.data.timeline).toEqual([{at: "00:00:00", topic: "开场"}]);
     expect(meta.data.text).toBeUndefined();
-    expect((await events.next()).data.text).toBe(firstPart);
-    expect(await events.next()).toEqual({event: "chapter", data: {id: "ch-1", title: "观测站"}});
-    expect((await events.next()).event).toBe("done");
+    const received = [];
+    do {
+      const event = await events.next();
+      expect(event.event).not.toBe("error");
+      received.push(event);
+    } while (received.at(-1)!.event !== "done");
+    const progress = received.filter(event => event.event === "coverage").map(event => event.data);
+    expect(progress[0]).toEqual({completed: 0, total: 1});
+    expect(progress.at(-1)).toEqual({completed: 1, total: 1});
+    expect(received.at(-1)!.data.coverage).toEqual(progress.at(-1));
+    const markdown = received.filter(event => event.event === "delta").map(event => event.data.text).join("");
+    expect(markdown).toContain(transcript);
+    expect(markdown).not.toContain("> 小结");
+    expect(await app.stores.get(meta.data.articleId)!.get("coverage")).toEqual(progress.at(-1));
+    expect(received.find(event => event.event === "chapter")?.data).toMatchObject({id: "ch-1", title: expect.stringMatching(/观测站$/)});
     const path = `/api/articles/${meta.data.articleId}/chapters/ch-1/summary`;
     expect((await app.get(path)).status).toBe(202);
     expect(requests).toHaveLength(1);
@@ -143,6 +162,29 @@ describe("Worker article workflow", () => {
     expect(await (await app.get(path)).json()).toEqual(summary);
     expect(await (await app.post(path)).json()).toEqual(summary);
     expect(requests).toHaveLength(3);
+  });
+
+  it.each(["incomplete", "unsealed", "skipped ID", "missing plan"])("never marks an %s transcript as finished", async failure => {
+    const app = fixture();
+    vi.spyOn(gemini, "writeArticle").mockImplementation(async function* () {
+      if (failure !== "missing plan") yield {coverage: {completed: 0, total: 2}};
+      yield "# 观察海洋\n\n## 水质\n\n主持人：今天测量水质。";
+      if (failure !== "skipped ID") yield {coverage: {completed: 1, total: 2}};
+      if (failure !== "incomplete") {
+        yield "我们再查一次。";
+        yield {coverage: {completed: 2, total: 2}};
+      }
+      if (failure !== "unsealed") yield {chapterEnd: true};
+    });
+    const events = readEvents(await app.post("/api/articles", {url}));
+    const meta = await events.next();
+    let event;
+    do {
+      event = await events.next();
+      expect(event.event).not.toBe("done");
+    } while (event.event !== "error");
+    const path = "/api/articles/" + meta.data.articleId + "/chapters/ch-1/summary";
+    expect((await app.get(path)).status).toBe(failure === "incomplete" ? 202 : 404);
   });
 
   it("makes a closed chapter available across split headings before the next chapter finishes", async () => {
@@ -160,7 +202,7 @@ describe("Worker article workflow", () => {
       }
       return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(summary) }] }, finishReason: "STOP" }] });
     });
-    const requirements = "给中学生阅读，用简明的问答形式";
+    const requirements = "只总结海洋监测，给中学生阅读，用简明的问答形式";
     const res = await app.post("/api/articles", { url, requirements });
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("text/event-stream");
@@ -219,7 +261,7 @@ describe("Worker article workflow", () => {
       }
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
     });
-    const events = readEvents(await app.post("/api/articles", {url}));
+    const events = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const meta = await events.next();
     expect((await events.next()).event).toBe("delta");
     expect(await events.next()).toEqual({event: "chapter", data: {id: "ch-1", title: "观测站"}});
@@ -248,7 +290,9 @@ describe("Worker article workflow", () => {
       if (!new Request(input, init).url.includes(":streamGenerateContent"))
         return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
       if (++articleCalls === 1) {
-        const topic = {articleTitle: "海洋对话", title: "观测站", body: "研究员介绍观测站。", recap: "观测站设在海上。"};
+        const topic = {articleTitle: "海洋对话", chapterTitle: "观测站", units: [
+          {id: 1, heading: "观测站介绍", speaker: "研究员", text: "研究员介绍观测站。"},
+        ]};
         return new Response(geminiFrame(JSON.stringify(topic), "STOP"));
       }
       signalNextRequest();
@@ -257,7 +301,7 @@ describe("Worker article workflow", () => {
     const events = readEvents(await app.post("/api/articles", {url: "https://youtu.be/AbC123deF45"}));
     const meta = await events.next();
     let event = await events.next();
-    while (event.event === "delta") event = await events.next();
+    while (["delta", "coverage"].includes(event.event)) event = await events.next();
     expect(event).toMatchObject({event: "chapter", data: {id: "ch-1"}});
     const next = events.next();
     await nextRequested;
@@ -267,7 +311,7 @@ describe("Worker article workflow", () => {
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
     finishNext(new Response(null, {status: 403}));
     event = await next;
-    while (event.event === "delta") event = await events.next();
+    while (["delta", "coverage"].includes(event.event)) event = await events.next();
     expect(event.event).toBe("error");
     await app.alarm(meta.data.articleId);
     expect((await app.get(base + "ch-1/summary")).status).toBe(200);
@@ -285,7 +329,7 @@ describe("Worker article workflow", () => {
         return new Response(geminiFrame(firstPart + "\n\n## 温度记录\n\n" + body, "STOP"));
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
     });
-    const events = readEvents(await app.post("/api/articles", {url}));
+    const events = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const meta = await events.next();
     expect((await events.next()).event).toBe("delta");
     expect(await events.next()).toMatchObject({event: "chapter", data: {id: "ch-1"}});
@@ -320,7 +364,7 @@ describe("Worker article workflow", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(geminiFrame(firstPart), {
       headers: { "Content-Type": "text/event-stream" },
     })));
-    const events = readEvents(await app.post("/api/articles", { url }));
+    const events = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const meta = await events.next();
     expect(meta.event).toBe("meta");
     expect((await events.next()).event).toBe("delta");
@@ -339,7 +383,7 @@ describe("Worker article workflow", () => {
       if (++calls === 1) return new Response(null, {status: 429, headers: {"Retry-After": "70"}});
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
     });
-    const stream = readEvents(await app.post("/api/articles", {url}));
+    const stream = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const id = (await stream.next()).data.articleId;
     while ((await stream.next()).event !== "done") { /* consume SSE */ }
     const path = "/api/articles/" + id + "/chapters/ch-1/summary";
@@ -381,7 +425,7 @@ describe("Worker article workflow", () => {
       if (calls === 1) { reported(); await hold; }
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify({...summary, what})}]}, finishReason: "STOP"}]});
     });
-    const stream = readEvents(await app.post("/api/articles", {url}));
+    const stream = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const id = (await stream.next()).data.articleId;
     while ((await stream.next()).event !== "done") { /* consume SSE */ }
     const interrupted = app.alarm(id);
@@ -409,7 +453,7 @@ describe("Worker article workflow", () => {
       if (++calls === 1) return new Response(null, {status: 403});
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
     });
-    const stream = readEvents(await app.post("/api/articles", {url}));
+    const stream = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const id = (await stream.next()).data.articleId;
     while ((await stream.next()).event !== "done") { /* consume SSE */ }
     await app.alarm(id);
@@ -417,7 +461,7 @@ describe("Worker article workflow", () => {
     const path = "/api/articles/" + id + "/chapters/ch-1/summary";
     const failure = await app.get(path);
     expect(failure.status).toBe(502);
-    expect(await failure.json()).toMatchObject({code: "SUMMARY_FAILED", error: expect.stringContaining("章末小结")});
+    expect(await failure.json()).toMatchObject({code: "SUMMARY_FAILED", error: expect.stringContaining("继续阅读本章正文")});
     expect((await app.get(path.replace("ch-1", "ch-2"))).status).toBe(200);
     expect((await app.post(path)).status).toBe(502);
     expect(calls).toBe(2);
@@ -435,7 +479,7 @@ describe("Worker article workflow", () => {
       const candidate = {content: {parts: [{text: complete ? JSON.stringify(summary) : "{"}]}, finishReason: complete ? "STOP" : "MAX_TOKENS"};
       return Response.json({candidates: [candidate]});
     });
-    const stream = readEvents(await app.post("/api/articles", {url}));
+    const stream = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const id = (await stream.next()).data.articleId;
     while ((await stream.next()).event !== "done") { /* consume SSE */ }
     const store = app.stores.get(id)!;
@@ -491,7 +535,7 @@ describe("Worker article workflow", () => {
       await response;
       return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
     });
-    const stream = readEvents(await app.post("/api/articles", {url}));
+    const stream = readEvents(await app.post("/api/articles", {url, requirements: scopedRequirements}));
     const id = (await stream.next()).data.articleId;
     while ((await stream.next()).event !== "done") { /* consume SSE */ }
     const path = "/api/articles/" + id + "/chapters/ch-1/summary";

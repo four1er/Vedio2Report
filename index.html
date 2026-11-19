@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f8f7f2" />
-    <meta name="description" content="用声稿把有字幕的 YouTube 视频整理成中文文章，逐章阅读并展开 5W1H 总结。" />
+    <meta name="description" content="按原片顺序将 YouTube 字幕转写成完整中文稿，逐章阅读并展开 5W1H 总结。" />
     <title>声稿 · 视频字幕写作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23ad462d'/%3E%3Cpath d='M9 17h4v9H9zm6-7h4v20h-4zm6 4h4v15h-4zm6 4h4v7h-4z' fill='white'/%3E%3C/svg%3E" />
   </head>
@@ -27,15 +27,15 @@
       <section class="intro" aria-labelledby="intro-title">
         <div class="intro-copy">
           <p class="eyebrow"><span class="short-rule"></span>视频字幕写作台</p>
-          <h1 id="intro-title">把视频字幕，<br />读成<span>一篇文章。</span></h1>
-          <p class="intro-description">粘贴访谈、讲座或教程的 YouTube 链接，边生成边读中文文章。</p>
+          <h1 id="intro-title">把视频字幕<br />转写成<span>完整中文稿。</span></h1>
+          <p class="intro-description">粘贴有字幕的 YouTube 链接，按原片顺序转写发言。边生成边读，每章都可展开 5W1H 总结。</p>
         </div>
         <img class="hero-art" src="/editorial-art.webp" alt="" width="544" height="320" fetchpriority="high" />
       </section>
       <div class="workspace" id="studio">
         <section class="editor panel" aria-labelledby="editor-title">
           <div class="card-heading">
-            <div class="heading-group"><span class="heading-icon" data-icon="pen"></span><h2 id="editor-title">生成新文章</h2></div>
+            <div class="heading-group"><span class="heading-icon" data-icon="pen"></span><h2 id="editor-title">生成中文稿</h2></div>
             <span class="engine" lang="en"><span data-icon="sparkles"></span>Gemini</span>
           </div>
           <form id="generate">
@@ -45,7 +45,7 @@
             <div class="input-wrap"><span data-icon="link"></span><input id="video" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" required autocomplete="url" aria-describedby="url-hint" maxlength="2048" /></div>
             <p class="hint" id="url-hint">支持带字幕的 YouTube 公开视频。</p>
             <div class="label-row prompt-label"><label for="requirements">写作要求<span class="optional">选填</span></label></div>
-            <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如：写给初学者，分三章解释重点，保留视频里的具体例子。"></textarea>
+            <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如：保留技术术语的英文原名，按发言人换段。"></textarea>
             <div class="form-actions"><button type="submit" class="primary" id="submit"><span data-icon="pen"></span><span id="submit-caption">开始生成</span><span data-icon="arrow"></span></button></div>
             <p id="feedback" role="alert" hidden></p>
           </form>
@@ -58,11 +58,11 @@
           </div>
           <div class="sample-copy">
             <p class="eyebrow"><span class="small-dot"></span>排版样稿</p>
-            <h2 id="sample-title">AI 才刚开场，<span class="subject">收入从哪里来？</span></h2>
-            <p class="sample-description">安德森访谈节译，含两章问答、小结和 5W1H。</p>
+            <h2 id="sample-title">对话安德森：AI革命的万亿美金之问</h2>
+            <p class="sample-description">飞书参考稿节选，含 Jen、John 与 Mark 关于 AI 的五轮问答。</p>
             <div class="sample-actions">
               <button id="sample" class="read-button" type="button"><span data-icon="book"></span>阅读样稿<span data-icon="arrow"></span></button>
-              <button id="fill" class="text-button" type="button">用这个视频试写<span data-icon="corner"></span></button>
+              <button id="fill" class="text-button" type="button">填入视频链接<span data-icon="corner"></span></button>
             </div>
           </div>
         </aside>
@@ -76,6 +76,7 @@
           <ol id="timeline-topics"></ol>
         </details>
         <p class="reader-status" id="reader-status" role="status"></p>
+        <p class="reader-coverage" id="reader-coverage" hidden></p>
         <div id="body" class="prose"></div>
       </section>
     </main>

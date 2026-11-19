@@ -1,6 +1,7 @@
 import { chapterRecapText } from '../shared/chapter-recap'
 
 export type Summary = Record<'who' | 'what' | 'when' | 'where' | 'why' | 'how', string>
+export interface TranscriptCoverage {completed: number; total: number}
 export const dimensions = ['who', 'what', 'when', 'where', 'why', 'how'] as const
 
 export interface Bindings {

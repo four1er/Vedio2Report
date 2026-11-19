@@ -50,7 +50,7 @@ it("starts summaries without any click and finishes writing while a summary is r
       const material = JSON.parse(payload.contents[0].parts[0].text);
       expect(material.video.text).toBe(transcript);
       if (pathname.endsWith(":streamGenerateContent")) {
-        expect(JSON.parse(payload.contents[0].parts[1].text).requirements).toBe("给中学生");
+        expect(JSON.parse(payload.contents[0].parts[1].text).requirements).toBe("给中学生写摘要");
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             controller.enqueue(frame(first + nextHeading));
@@ -79,7 +79,7 @@ it("starts summaries without any click and finishes writing while a summary is r
     const base = "https://example.test/api/articles";
     const response = await runtime.dispatchFetch(base, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: "https://youtu.be/" + videoId, requirements: "给中学生" }),
+      body: JSON.stringify({ url: "https://youtu.be/" + videoId, requirements: "给中学生写摘要" }),
     });
     expect(response.status).toBe(200);
     const stream = events(response);

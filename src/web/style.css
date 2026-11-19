@@ -103,7 +103,8 @@ textarea {resize:vertical;min-height:76px;display:block;line-height:1.65}
 .reader {max-width:900px;margin:32px auto 0;padding:28px clamp(20px,6vw,76px) 44px;scroll-margin-top:14px;min-height:calc(100svh - 28px)}
 .reader-bar {justify-content:space-between;min-height:30px;margin-bottom:16px}
 .reader h2 {font-size:clamp(29px,4vw,43px);line-height:1.45}
-.reader-source,.reader-status {font-size:13px;color:var(--muted);margin:10px 0}
+.reader-source,.reader-status,.reader-coverage {font-size:13px;color:var(--muted);margin:10px 0}
+.reader-coverage {font-variant-numeric:tabular-nums}
 .reader-source a,.reader-timeline a:hover,.chapter-time:hover {text-decoration:underline}
 .reader-timeline {font-size:14px;margin:12px 0;color:var(--muted)}
 .reader-timeline summary {cursor:pointer;color:var(--rust);width:fit-content}
@@ -117,9 +118,7 @@ textarea {resize:vertical;min-height:76px;display:block;line-height:1.65}
 .reader-status:empty {display:none}
 .prose {font-family:var(--serif);font-size:17px;line-height:1.95;overflow-wrap:anywhere}
 .prose p {margin:1em 0}
-.prose .speaker-turn {display:grid;grid-template-columns:5.5em minmax(0,1fr);column-gap:1em;margin:.85em 0}
-.speaker-label {font-family:system-ui,sans-serif;font-size:.88em;color:var(--rust);line-height:inherit;padding-top:.12em}
-.prose .speaker-continuation {margin:.65em 0 .65em 6.5em}
+.speaker-label {font-weight:700}
 .prose blockquote {margin:1em 0;padding:.5em 1em;background:#f5f2e9;border-left:3px solid var(--rust)}
 .prose ul,.prose ol {padding-left:1.6em}
 .chapter-head {display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:21px;margin-top:28px}
@@ -166,9 +165,6 @@ footer em {font-family:Georgia,serif;margin-left:4px}
  .reader {padding:18px 18px 30px}
  .reader-bar {margin-bottom:9px}
  .prose {font-size:16px}
- .prose .speaker-turn {display:block}
- .speaker-label {margin-right:.2em}
- .prose .speaker-continuation {margin-left:0}
 }
 @media(max-width:420px) {
  .intro {grid-template-columns:1fr .55fr}
@@ -182,5 +178,3 @@ footer em {font-family:Georgia,serif;margin-left:4px}
  .editor {padding:16px}
 }
 @media(prefers-reduced-motion:reduce) {*,*::before,*::after {scroll-behavior:auto!important;transition:none!important}}
-
-.sample-copy h2 .subject {white-space:nowrap}

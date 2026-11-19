@@ -22,6 +22,7 @@ const article = element('article');
 const title = element('reader-title');
 const body = element('body');
 const status = element('reader-status');
+const coverage = element('reader-coverage');
 const source = element('reader-source');
 const timeline = element<HTMLDetailsElement>('reader-timeline');
 const topics = element<HTMLOListElement>('timeline-topics');
@@ -52,13 +53,15 @@ function openResult(sample: boolean) {
   body.replaceChildren();
   copy.hidden = true;
   element('copy-label').textContent = '复制正文';
-  element('reader-mode').textContent = sample ? '排版样稿 · 字幕节译' : '已录视频 · 根据字幕整理';
+  element('reader-mode').textContent = sample ? '排版样稿 · 参考稿节选' : requirements.value.trim() ? '按要求生成' : '全文转写';
   title.textContent = sample ? '排版样稿' : '正在准备字幕…';
   source.textContent = '';
   topics.replaceChildren();
   timeline.open = false;
   timeline.hidden = true;
   status.textContent = '';
+  coverage.textContent = '';
+  coverage.hidden = true;
   switchNav(sample);
   article.scrollIntoView({ block: 'start' });
   title.focus({ preventScroll: true });
@@ -69,7 +72,7 @@ function showSample() {
   markdown = sampleMarkdown;
   const links = new Map<number, string>();
   displaySource(sampleSource, links);
-  source.append(' · 两章问答与 5W1H 均为预置样稿');
+  source.append(' · 章节 5W1H 为预置示例');
   const render = createArticleRenderer(body, title, async id => sampleSummaries[id], links, readerLifetime.signal);
   render(markdown, sampleChapters);
   copy.hidden = false;
@@ -80,7 +83,7 @@ navStudio.addEventListener('click', () => { switchNav(false); input.focus({ prev
 element('fill').addEventListener('click', () => {
   input.value = 'https://www.youtube.com/watch?v=' + sampleSource.videoId;
   input.setCustomValidity('');
-  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可试写。';
+  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可转写。';
   tell('');
   input.focus();
 });
@@ -100,6 +103,7 @@ function setBusy(busy: boolean) {
   stop.textContent = busy ? '取消' : '停止生成';
 }
 function sourceName(kind: string, downloaded?: boolean) {
+  if (kind === 'reference-excerpt') return '参考稿节选';
   if (kind === 'cached') return 'W3C WAI 官方逐字稿';
   if (kind === 'archived-youtube') return 'YouTube 字幕存档';
   if (kind === 'published-captions') return '公开发布的字幕';
@@ -159,7 +163,7 @@ function timecode(seconds: number) {
 
 function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?: boolean) {
   source.textContent = sourceName(meta.source, downloaded);
-  if (meta.source === 'published-captions') {
+  if (meta.source === 'published-captions' || meta.source === 'reference-excerpt') {
     const label = meta.sourceLabel?.trim();
     let sourceUrl: URL | undefined;
     if (meta.sourceUrl && URL.canParse(meta.sourceUrl)) sourceUrl = new URL(meta.sourceUrl);
@@ -214,6 +218,15 @@ function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?
   }
   timeline.hidden = !topics.childElementCount;
 }
+
+function displayCoverage(data: {completed: number; total: number}) {
+  if (!Number.isSafeInteger(data.completed) || !Number.isSafeInteger(data.total) ||
+      data.total <= 0 || data.completed < 0 || data.completed > data.total) return;
+  element('reader-mode').textContent = '全文转写';
+  coverage.textContent = '已转写字幕片段 ' + data.completed + ' / ' + data.total;
+  coverage.hidden = false;
+}
+
 form.addEventListener('submit', async event => {
   event.preventDefault();
   if (pending) return;
@@ -223,7 +236,7 @@ form.addEventListener('submit', async event => {
   setBusy(true);
   tell('');
   openResult(false);
-  status.textContent = '正在检查可用字幕，确认后下载并开始写作…';
+  status.textContent = '正在检查可用字幕，确认后下载并生成正文…';
   let id = '';
   let captionsReady = false;
   const readyChapters: Chapter[] = [];
@@ -242,7 +255,7 @@ form.addEventListener('submit', async event => {
     captionsReady = true;
     displaySource(captions.source, links, captions.downloaded);
     status.textContent = '字幕已就绪，正在连接 Gemini…';
-    title.textContent = '正在准备文章…';
+    title.textContent = '正在准备中文稿…';
     element('submit-caption').textContent = '生成中…';
     stop.textContent = '停止生成';
     const response = await fetch('/api/articles', {
@@ -259,9 +272,11 @@ form.addEventListener('submit', async event => {
         displaySource(data, links, captions.downloaded);
         status.textContent = '字幕已就绪，正在等待 Gemini 输出正文…';
       } else if (type === 'delta' && typeof data.text === 'string') {
-        if (!markdown) status.textContent = 'Gemini 正在写作…';
+        if (!markdown) status.textContent = '正在生成正文…';
         markdown += data.text;
         schedulePaint();
+      } else if (type === 'coverage') {
+        displayCoverage(data);
       } else if (type === 'chapter' && data.id === 'ch-' + (readyChapters.length + 1) && typeof data.title === 'string') {
         readyChapters.push({id: data.id, title: data.title});
         status.textContent = '已完成 ' + readyChapters.length + ' 章，可展开 5W1H';
@@ -270,6 +285,7 @@ form.addEventListener('submit', async event => {
         throw new Error(typeof data.message === 'string' ? data.message : '生成中断，请重试。');
       } else if (type === 'done') {
         if (!Array.isArray(data.chapters)) throw new Error('章节信息缺失，请重新生成。');
+        if (data.coverage) displayCoverage(data.coverage);
         readyChapters.splice(0, readyChapters.length, ...data.chapters);
         complete = true;
       }

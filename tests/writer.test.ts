@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getVideoSource, type Video } from "../src/worker/captions";
 import { summarize, TransientError, writeArticle } from "../src/worker/gemini";
+import type { ArticleUpdate } from "../src/worker/gemini";
+import type { TranscriptInput } from "../src/worker/transcript-response";
 import type { Bindings } from "../src/worker/protocol";
 import { cachedCaptions, cachedVideoId } from "../src/worker/sample";
 
@@ -12,7 +14,6 @@ const video: Video = {
   text: "Opening sentence.\nOpening detail.\nClosing sentence.",
   timeline: [{at: "0:00", firstCue: 1, topic: "Opening"}, {at: "1:15:50", firstCue: 3, topic: "Closing"}],
 };
-const first = {articleTitle: "访谈记录", title: "开场讨论", body: "先介绍观测背景，再说明方法。", recap: "本章交代观测方法。"};
 const last = {title: "结束讨论", body: "最后核对数据。", recap: "本章确认观测结果。"};
 
 afterEach(() => vi.unstubAllGlobals());
@@ -35,214 +36,313 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   return chunks;
 }
 
-describe("chronological chapter writing", () => {
-  it("uses the archive’s publisher timeline and the same grounded content rules as other videos", async () => {
-    const source = await getVideoSource("xRh2sVcNXQ8");
-    const requested: {text: string; at: string; topic: string; previousExcerpt?: string}[] = [];
-    const fetcher = vi.fn(async (url: string, init: RequestInit) => {
-      expect(url).toContain(":streamGenerateContent?alt=sse");
-      const payload = JSON.parse(String(init.body));
-      expect(payload.generationConfig.responseMimeType).toBe("application/json");
-      expect(payload.contents[0].parts).toHaveLength(1);
-      const input = JSON.parse(payload.contents[0].parts[0].text);
-      expect(input.sourceTitle).toBe(source.title);
-      expect(input).not.toHaveProperty("video");
-      expect(input).not.toHaveProperty("editorNotes");
-      expect(payload.systemInstruction.parts[0].text).not.toMatch(/安德森|火星|\b(?:Jen|John|Mark)\b/);
-      requested.push(input);
-      const n = requested.length;
-      return complete({
-        ...(n === 1 && {articleTitle: "全场访谈", lead: "这场访谈讨论技术发展。"}),
-        title: "话题" + n, body: "### 议题细节\n\n依据本段发言整理的观点。", recap: "第" + n + "段核心观点。",
-      });
-    });
-    vi.stubGlobal("fetch", fetcher);
+type Row = {id: number; heading: string; speaker: string; text: string; turns?: {speaker: string; text: string}[]};
+const spoken: Video = {...video, timeline: undefined, text: "Jen: Why twice?\nMark: I measured twice.\nAnd I checked."};
+const articles = {articleTitle: "现场访谈", chapterTitle: "核对读数"};
+const transcriptRows: Row[] = [
+  {id: 1, heading: "测量的次数", speaker: "Jen", text: "为什么测两次？"},
+  {id: 2, heading: "", speaker: "Mark", text: '我记录了“二次”读数。\n有条记录写着 "{2}"。'},
+  {id: 3, heading: "", speaker: "Mark", text: "我又核对了一次。"},
+];
+function markdown(chunks: ArticleUpdate[]) {
+  return chunks.filter((chunk): chunk is string => typeof chunk === "string").join("");
+}
+function progress(chunks: ArticleUpdate[]) {
+  return chunks.flatMap(chunk => typeof chunk === "object" && "coverage" in chunk ? [chunk.coverage] : []);
+}
+function ends(chunks: ArticleUpdate[]) {
+  return chunks.filter(chunk => typeof chunk === "object" && "chapterEnd" in chunk);
+}
+function echo(input: TranscriptInput) {
+  return {
+    ...articles, chapterTitle: input.topic || articles.chapterTitle,
+    units: input.units.map(({id, text}) => ({id, heading: "", speaker: "", text})),
+  };
+}
+function known(input: TranscriptInput) {
+  return {...articles, units: input.units.map(({id}) => transcriptRows[id - 1])};
+}
+function mockWriter(reply: (input: TranscriptInput, n: number) => Response) {
+  const requests: {input: TranscriptInput; url: string; instruction: string; mime?: string; requirements?: string}[] = [];
+  const fetcher = vi.fn(async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const [source, preferences] = body.contents[0].parts;
+    const input = JSON.parse(source.text);
+    requests.push({input, url, instruction: body.systemInstruction.parts[0].text,
+      mime: body.generationConfig.responseMimeType, requirements: preferences && JSON.parse(preferences.text).requirements});
+    return reply(input, requests.length);
+  });
+  vi.stubGlobal("fetch", fetcher);
+  return requests;
+}
 
-    const events = await collect(writeArticle(env, {video: {...source, videoId: "xRh2sVcNXQ8"}}, signal()));
-    expect(requested.length).toBe(12);
-    expect(requested.map(({at, topic}) => ({at, topic}))).toEqual(source.timeline?.map(({at, topic}) => ({at, topic})));
-    expect(requested.map(({text}) => text).join("\n") === source.text).toBe(true);
-    expect(requested[0].previousExcerpt).toBeUndefined();
-    for (const [i, chapter] of requested.slice(1).entries()) {
-      expect(chapter.previousExcerpt?.length).toBeLessThanOrEqual(480);
-      expect(requested[i].text.endsWith(chapter.previousExcerpt!)).toBe(true);
-    }
-
-    const chapterTexts: string[] = [];
-    let pendingText = "";
-    for (const delta of events) {
-      if (typeof delta === "string") pendingText += delta;
-      else {
-        expect(delta).toEqual({chapterEnd: true});
-        chapterTexts.push(pendingText.trim());
-        pendingText = "";
-      }
-    }
-    expect(chapterTexts).toHaveLength(12);
-    expect(pendingText.trim()).toBe("");
-    expect(chapterTexts[0]).toMatch(/^# 全场访谈\n/);
-    expect(chapterTexts[0]).not.toMatch(/编辑说明|\*\*(?:Jen|John|Mark)/);
-    for (const [i, mark] of source.timeline!.entries()) {
-      expect(chapterTexts[i]).toContain("## [" + mark.at + "] 话题" + (i + 1) + "\n");
-      expect(chapterTexts[i].split("\n").at(-1)).toBe("> 小结：第" + (i + 1) + "段核心观点。");
-    }
+describe("complete transcript writing", () => {
+  it("submits all archive captions in order and publishes each source section exactly once", async () => {
+    const videoId = "xRh2sVcNXQ8";
+    const source = await getVideoSource(videoId);
+    const requests = mockWriter(input => complete({...echo(input), units: input.units.map(({id}) => ({
+      id, speaker: "", heading: "", text: "第" + id + "段。“记录每次测量使用的仪器和方法，观察读数的变化并记录原始数值，然后再次校准设备。”",
+    }))}));
+    const events = await collect(writeArticle(env, {video: {...source, videoId}}, signal()));
+    const units = requests.flatMap(r => r.input.units);
+    const compact = (text: string) => text.replace(/\s/gu, "");
+    expect(compact(units.map(u => u.text).join("")) === compact(source.text)).toBe(true);
+    expect(units.map(u => u.id)).toEqual(units.map((_, i) => i + 1));
+    expect(units[0].firstCue).toBe(1);
+    expect(units.at(-1)?.lastCue).toBe(source.cueCount);
+    expect(requests.length).toBeGreaterThan(source.timeline!.length);
+    expect(requests.every(r => r.url.includes(":streamGenerateContent?alt=sse") && r.mime === "application/json")).toBe(true);
+    expect(requests.every(r => r.input.sourceTitle === source.title && !("video" in r.input))).toBe(true);
+    expect(requests[0].instruction).not.toMatch(/安德森|\b(?:Jen|John|Mark)\b/);
+    expect(requests[0].instruction).toMatch(/人名和产品专名.*保留原文拼写/);
+    expect(requests[0].instruction).toMatch(/型号与版本号照录原文.*不同版本逐一保留/);
+    expect(requests[1].input.previousExcerpt).toBe(requests[0].input.units.at(-1)?.text);
+    const article = markdown(events);
+    expect(article.match(/^# /gm)).toHaveLength(1);
+    expect(article.match(/^## .+/gm)).toEqual(source.timeline!.map(mark => "## [" + mark.at + "] " + mark.topic));
+    expect(article).not.toContain("> 小结：");
+    expect(ends(events)).toHaveLength(source.timeline!.length);
+    expect(progress(events)).toEqual(Array.from({length: units.length + 1}, (_, completed) => ({completed, total: units.length})));
   });
 
-  it.each([1, 2])("covers every cue of a long video without publisher topics, including an unmarked lead-in (first timed cue %i)", async firstCue => {
-    const lines = Array.from({length: 72}, (_, i) => "演示第" + i + "项测量。");
-    const marks = Array.from({length: 8}, (_, i) => ({at: i * 5 + ":00", firstCue: firstCue + i * 9}));
-    const source: Video = {
-      source: "youtube", videoId: "4hAPjL7hEgo", title: "课堂演示", text: lines.join("\n"),
-      timeline: marks, lastCaptionSeconds: 36 * 60,
-    };
-    const inputs: {text: string; at?: string; previousExcerpt?: string}[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
-      const payload = JSON.parse(String(init.body));
-      const input = JSON.parse(payload.contents[0].parts[0].text);
-      expect(input).not.toHaveProperty("topic");
-      expect(payload.systemInstruction.parts[0].text).toMatch(/单人讲解、教学演示/);
-      expect(payload.systemInstruction.parts[0].text).toContain("禁止根据回答补造");
-      inputs.push(input);
-      return complete(inputs.length === 1 ? first : last);
+  it("keeps the next batch's unseen speech out of context, including when a turn ends mid-sentence", async () => {
+    // The row cap makes this a two-batch chapter. Each phrase occurs only once.
+    const text = Array.from({length: 21}, (_, i) => ">> unique utterance " + (i + 1) + " for the class").join("\n");
+    const requests = mockWriter(input => complete(echo(input)));
+    await collect(writeArticle(env, {video: {...spoken, text}}, signal()));
+    expect(requests).toHaveLength(2);
+    const [first, second] = requests.map(request => request.input);
+    expect(JSON.stringify(first)).not.toContain("unique utterance 21");
+    expect(first).not.toHaveProperty("previousTranslation");
+    expect(second.previousExcerpt).toContain("unique utterance 20");
+    expect(second.previousTranslation).toContain("unique utterance 20");
+    expect(second.units.map(unit => unit.id)).toEqual([21]);
+  });
+
+  it("repairs a shifted row alone before displaying names copied from the next row, preserving authentic repetition", async () => {
+    const repeated = ">> I compared QuantaBus with NanoDock.";
+    const video = {...spoken, text: [">> We checked the pressure.", repeated, repeated].join("\n")};
+    const requests = mockWriter((input, n) => complete({
+      ...articles, units: input.units.map(unit => ({
+        id: unit.id, heading: "", speaker: "", text: unit.id === 1 && n > 1 ? "我们核对了压力。" : "我对照了 QuantaBus 和 NanoDock。",
+      })),
     }));
-    const chunks = await collect(writeArticle(env, {video: source}, signal()));
-    expect(inputs.map(i => i.at)).toEqual([firstCue === 1 ? "0:00" : undefined, "10:00", "20:00", "30:00"]);
-    expect(inputs.map(i => i.text).join("\n")).toBe(source.text);
-    expect(inputs[0].previousExcerpt).toBeUndefined();
-    expect(inputs[1].previousExcerpt).toBe(lines.slice(marks[2].firstCue - 9, marks[2].firstCue - 1).join("\n"));
-    const raw = chunks.filter(chunk => typeof chunk === "string").join("");
-    expect(raw).toContain(firstCue === 1 ? "## [0:00] 开场讨论" : "## 开场讨论");
-    expect(raw).not.toMatch(/主持人|受访者|问答|编辑说明/);
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toHaveLength(4);
+    const events = await collect(writeArticle(env, {video}, signal()));
+    expect(requests.map(r => r.input.units.map(unit => unit.id))).toEqual([[1, 2, 3], [1], [2, 3]]);
+    expect(JSON.stringify(requests[1].input)).not.toContain("NanoDock");
+    const body = markdown(events);
+    expect(body.indexOf("核对了压力")).toBeLessThan(body.indexOf("QuantaBus"));
+    expect(body.match(/QuantaBus/g)).toHaveLength(2);
+    expect(progress(events).map(p => p.completed)).toEqual([0, 1, 2, 3]);
   });
 
-  it("streams within an interview turn, preserving the lead, subheadings, speakers and unlabeled continuation", async () => {
-    let controller!: ReadableStreamDefaultController<Uint8Array>;
-    const response = new Response(new ReadableStream<Uint8Array>({start(c) { controller = c; }}));
-    const fetcher = vi.fn().mockResolvedValueOnce(response).mockResolvedValueOnce(complete(last));
-    vi.stubGlobal("fetch", fetcher);
-    // Quotes are escaped in model JSON and a new SSE frame can start halfway through that escape.
-    const opening = "### 第几局？";
-    const question = "**Jen：** 现在进入第几局？";
-    const answer = '**Mark：** 受访者说"请看图"。';
-    const continuation = "这个判断还要结合接下来的发展。";
-    const special = {
-      articleTitle: first.articleTitle, lead: "这场对话讨论技术发展。", title: first.title,
-      body: [opening, question, answer, continuation].join("\n\n"), recap: first.recap,
-    };
-    const raw = JSON.stringify(special);
-    const split = raw.indexOf('说') + 2;
-    const chunks: (string | {chapterEnd: true})[] = [];
-    const reading = (async () => {
-      for await (const delta of writeArticle(env, {video}, signal())) chunks.push(delta);
-    })();
-
-    try {
-      controller.enqueue(encoder.encode(frame(raw.slice(0, split))));
-      await vi.waitFor(() => expect(chunks.join("")).toContain("**Mark：** 受访者说"));
-      expect(chunks.join("")).not.toContain("请看图");
-      expect(chunks).not.toContainEqual({chapterEnd: true});
-      expect(fetcher).toHaveBeenCalledTimes(1);
-      controller.enqueue(encoder.encode(frame(raw.slice(split))));
-      await vi.waitFor(() => expect(chunks.join("")).toContain(special.body));
-      expect(chunks).not.toContainEqual({chapterEnd: true});
-      expect(fetcher).toHaveBeenCalledTimes(1);
-    } finally {
-      controller.enqueue(encoder.encode(frame("", "STOP")));
-      controller.close();
-      await reading;
-    }
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toEqual([{chapterEnd: true}, {chapterEnd: true}]);
-    const article = chunks.filter(chunk => typeof chunk === "string").join("");
-    expect(article.indexOf(special.lead)).toBeGreaterThan(article.indexOf("# " + first.articleTitle));
-    expect(article.indexOf(special.lead)).toBeLessThan(article.indexOf("## [0:00]"));
-    expect(article.split(special.body)).toHaveLength(2);
-    expect(article.split("**Mark：**")).toHaveLength(2);
-    expect(fetcher).toHaveBeenCalledTimes(2);
+  it("retries a substituted spelling in a translated product list with the actual source names", async () => {
+    const video = {...spoken, text: "We used RedBus and Pyro, then MonoFab and TX."};
+    const requests = mockWriter((input, n) => complete({
+      ...articles, units: [{id: input.units[0].id, heading: "", speaker: "",
+        text: n === 1 ? "我们使用了 RedBus 和 Pyro，还有 MonoFab 和 Texagon。" : "我们使用了 RedBus 和 Pyro，还有 MonoFab 和 TX。"}],
+    }));
+    const article = markdown(await collect(writeArticle(env, {video}, signal())));
+    expect(requests).toHaveLength(2);
+    expect(requests[1].input.repair).toContain("RedBus、Pyro、MonoFab、TX");
+    expect(article).toContain("MonoFab 和 TX");
+    expect(article).not.toContain("Texagon");
   });
 
   it.each([
-    ["missing", JSON.stringify({articleTitle: first.articleTitle, title: first.title, body: first.body})],
-    ["blank", JSON.stringify({...first, recap: "   "})],
-    ["truncated", JSON.stringify(first).slice(0, -1)],
-  ])("never publishes a chapter with a %s recap or response", async (_reason, raw) => {
-    const fetcher = vi.fn(async () => new Response(frame(raw, "STOP")));
-    vi.stubGlobal("fetch", fetcher);
-    const emitted = [];
-    await expect((async () => {
-      for await (const delta of writeArticle(env, {video}, signal())) emitted.push(delta);
-    })()).rejects.toThrow();
-    expect(emitted).not.toContainEqual({chapterEnd: true});
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    "我们使用了红色总线和派罗，还有 MonoFab 与 TX。",
+    "We used RedBus and Pyro, then MonoFab and an alternative term.",
+  ])("accepts ordinary translated names and prose outside mixed-script lists", async translation => {
+    const video = {...spoken, text: "We used RedBus and Pyro, then MonoFab and TX."};
+    const requests = mockWriter(input => complete({...articles, units: [
+      {id: input.units[0].id, heading: "", speaker: "", text: translation},
+    ]}));
+    expect(markdown(await collect(writeArticle(env, {video}, signal())))).toContain(translation);
+    expect(requests).toHaveLength(1);
   });
 
-  it("retries a busy later topic without repeating an already published chapter", async () => {
-    const fetcher = vi.fn().mockResolvedValueOnce(complete(first));
-    for (let attempt = 0; attempt < 3; attempt++) {
-      fetcher.mockResolvedValueOnce(new Response("", {status: 503, headers: {"retry-after": "0"}}));
+  it("retries a full English passage in default Chinese mode without changing a requested English transcript or a model list", async () => {
+    const source = "We use the pressure gauge to measure how the air moves through the machine, and we record the results of the experiment.";
+    const translated = "我们用压力计测量空气在机器里的流动情况，并记录实验结果。";
+    const requests = mockWriter((input, n) => complete({...articles, units: [
+      {id: 1, heading: "", speaker: "", text: n === 2 ? translated : input.units[0].text},
+    ]}));
+    const render = async (text: string, requirements = "") => markdown(await collect(writeArticle(env, {video: {...spoken, text}, requirements}, signal())));
+    expect(await render(source)).toContain(translated);
+    expect(requests).toHaveLength(2);
+    expect(requests[1].input.repair).toContain("叙述必须译成中文");
+    expect(await render(source, "请输出英文。")).toContain(source);
+    const models = "AB-100, CD-200, ".repeat(8) + "TX";
+    expect(await render(models)).toContain(models);
+    expect(requests).toHaveLength(4);
+  });
+
+  it.each(["请面向高中生，使用自然些的措辞。", "不要总结，逐字转写。", "分为两章。"])(
+    "retains every source unit when the reader asks %s", async requirements => {
+      const requests = mockWriter(input => complete(echo(input)));
+      const chunks = await collect(writeArticle(env, {video: spoken, requirements}, signal()));
+      expect(requests.flatMap(r => r.input.units.map(u => u.id))).toEqual([1, 2, 3]);
+      expect(requests.every(r => r.requirements === requirements)).toBe(true);
+      expect(ends(chunks)).toHaveLength(requirements.includes("两章") ? 2 : 1);
+      expect(progress(chunks).at(-1)).toEqual({completed: 3, total: 3});
+      expect(markdown(chunks)).not.toMatch(/\[\d+:\d+\]/);
+  });
+
+  it("preserves a monologue or an answer-only source without assigning an interviewer", async () => {
+    const source = {...spoken, text: "I saw three marks.\nI counted them again."};
+    const requests = mockWriter(input => complete({...articles, units: input.units.map(({id}) => ({
+      id, heading: "三处读数", speaker: "", text: "我看到了三处标记。\n\n我又数了一遍。",
+    }))}));
+    const article = markdown(await collect(writeArticle(env, {video: source}, signal())));
+    expect(article).toContain("### 三处读数\n\n我看到了三处标记。\n\n我又数了一遍。");
+    expect(article).not.toMatch(/主持人|受访者|编辑说明|\*\*/);
+    expect(requests[0].instruction).toMatch(/禁止根据回答补造问题/);
+  });
+
+  it("streams checked speech before STOP but holds partial JSON and the last record until completion", async () => {
+    let upstream!: ReadableStreamDefaultController<Uint8Array>;
+    const response = new Response(new ReadableStream<Uint8Array>({start(controller) { upstream = controller; }}));
+    const requests = mockWriter(() => response);
+    const chunks: ArticleUpdate[] = [];
+    const reading = (async () => {
+      for await (const chunk of writeArticle(env, {video: spoken}, signal())) chunks.push(chunk);
+    })();
+    const output = JSON.stringify({...articles, units: transcriptRows});
+    const split = output.indexOf('"{2}') - 1;
+    try {
+      upstream.enqueue(encoder.encode(frame(output.slice(0, split))));
+      await vi.waitFor(() => expect(markdown(chunks)).toContain("**Jen：** 为什么测两次？"));
+      expect(markdown(chunks)).not.toContain("**Mark");
+      upstream.enqueue(encoder.encode(frame(output.slice(split))));
+      await vi.waitFor(() => expect(markdown(chunks)).toContain('有条记录写着 "{2}"。'));
+      expect(markdown(chunks)).not.toContain(transcriptRows[2].text);
+      expect(ends(chunks)).toHaveLength(0);
+    } finally {
+      upstream.enqueue(encoder.encode(frame("", "STOP")));
+      upstream.close();
+      await reading;
     }
-    fetcher.mockResolvedValueOnce(complete(last));
-    vi.stubGlobal("fetch", fetcher);
-    const chunks = await collect(writeArticle(env, {video}, signal()));
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toHaveLength(2);
-    expect(chunks.join("").split(first.body)).toHaveLength(2);
-    expect(fetcher).toHaveBeenCalledTimes(5);
+    const article = markdown(chunks);
+    expect(article).toBe('# 现场访谈\n\n## 核对读数\n\n### 测量的次数\n\n**Jen：** 为什么测两次？\n\n**Mark：** 我记录了“二次”读数。\n\n有条记录写着 "{2}"。\n\n我又核对了一次。');
+    expect(progress(chunks).map(p => p.completed)).toEqual([0, 1, 2, 3]);
+    expect(ends(chunks)).toHaveLength(1);
+    expect(requests).toHaveLength(1);
   });
 
-  it.each([429, 503])("recovers from a transient HTTP %i before publishing a topic", async status => {
-    const fetcher = vi.fn()
-      .mockResolvedValueOnce(new Response("", {status, headers: {"retry-after": "0"}}))
-      .mockResolvedValueOnce(complete(first)).mockResolvedValueOnce(complete(last));
-    vi.stubGlobal("fetch", fetcher);
-    const chunks = await collect(writeArticle(env, {video}, signal()));
-    expect(fetcher).toHaveBeenCalledTimes(3);
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toHaveLength(2);
-    expect(chunks.join("").split(first.body)).toHaveLength(2);
-    expect(chunks.join("").split(last.body)).toHaveLength(2);
+  it("keeps anonymous >> interjections separate, carries their unfinished speech and honors explicit source names", async () => {
+    const longTurn = ">> " + "carry this thought forward ".repeat(16) + "to its end.";
+    const video = {...spoken, text: ["Rae: First.", longTurn, ">> I agree.", ">> Jo: Last."].join("\n")};
+    const longFirst = "把这个想法保持下来，沿着此前的讨论继续往下说，也考虑大家先前的看法，然后我们还应该";
+    const rows = [
+      ["Rae", "第一个想法。"], ["Rae", longFirst], ["Rae", "沿着原有思路，把整段想说的话说完。"],
+      ["", "我也同意。"], ["Rae", "这是最后一句。"],
+    ];
+    mockWriter(input => complete({...articles, units: input.units.map(({id}) => ({
+      id, heading: "", speaker: rows[id - 1][0], text: rows[id - 1][1],
+    }))}));
+    const article = markdown(await collect(writeArticle(env, {video}, signal())));
+    expect(article).toContain("**Rae：** 第一个想法。\n\n**未署名发言人：** " + longFirst + "沿着原有思路，把整段想说的话说完。");
+    expect(article).toContain("\n\n**未署名发言人：** 我也同意。\n\n**Jo：** 这是最后一句。");
+    expect(article.match(/未署名发言人/g)).toHaveLength(2);
   });
 
-  it.each(["", '{"articleTitle":"尚未显示'])("retries an in-stream error before any user-visible text (prefix %j)", async prefix => {
-    const unavailable = {error: {code: 503, status: "UNAVAILABLE", message: "model overloaded"}};
-    const fetcher = vi.fn().mockResolvedValueOnce(new Response(frame(prefix) + event(unavailable)))
-      .mockResolvedValueOnce(complete(first)).mockResolvedValueOnce(complete(last));
-    vi.stubGlobal("fetch", fetcher);
-    const chunks = await collect(writeArticle(env, {video}, signal()));
-    expect(fetcher).toHaveBeenCalledTimes(3);
-    expect(chunks.join("")).not.toContain("尚未显示");
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toEqual([{chapterEnd: true}, {chapterEnd: true}]);
+  it("keeps multiple turns in a single mapped unit and the last speaker's continuation", async () => {
+    const source = {...spoken, text: "Ada: Is it time? Lin said yes, but Jo objected.\nJo: I need another minute."};
+    const units: Row[] = [
+      {id: 1, heading: "复核时间", speaker: "Ada", text: "时间到了吗？", turns: [
+        {speaker: "Lin", text: "是的。"}, {speaker: "Jo", text: "我还没核对完。"},
+      ]}, {id: 2, heading: "", speaker: "Jo", text: "我还需要一分钟。"},
+    ];
+    mockWriter(() => complete({...articles, units}));
+    const chunks = await collect(writeArticle(env, {video: source}, signal()));
+    expect(markdown(chunks)).toContain("**Ada：** 时间到了吗？\n\n**Lin：** 是的。\n\n**Jo：** 我还没核对完。\n\n我还需要一分钟。");
+    expect(progress(chunks).map(p => p.completed)).toEqual([0, 1, 2]);
   });
 
-  it("keeps Markdown-style opening lines in model prose from introducing extra headings or recaps", async () => {
-    const body = ["> 引述研究员原话。", "### 数据口径", "**林老师**: 数据准确吗？", "**学生乙：** 核对数据。",
-      "## 伪造的新章", "> 小结：伪造的章末。", "> ## 引用中的伪标题", "> > 小结：引用中的伪小结。"].join("\n\n");
-    const raw = JSON.stringify({...last, body});
-    const markedResponse = new Response(Array.from(raw, char => frame(char)).join("") + frame("", "STOP"));
-    const fetcher = vi.fn().mockResolvedValueOnce(complete({...first, body: "## 模型提供的正文"}))
-      .mockResolvedValueOnce(markedResponse);
-    vi.stubGlobal("fetch", fetcher);
-    const chunks = await collect(writeArticle(env, {video}, signal()));
-    const lines = chunks.filter(chunk => typeof chunk === "string").join("").split("\n");
-    expect(lines.filter(line => line.startsWith("## "))).toEqual(["## [0:00] " + first.title, "## [1:15:50] " + last.title]);
-    expect(lines.filter(line => line.startsWith("> "))).toEqual(["> 小结：" + first.recap, "> 小结：" + last.recap]);
-    expect(lines).toContain("模型提供的正文");
-    expect(lines).toContain("引述研究员原话。");
-    expect(lines).toContain("### 数据口径");
-    expect(lines).toContain("**林老师**: 数据准确吗？");
-    expect(lines).toContain("**学生乙：** 核对数据。");
+  it.each(["missing", "duplicated", "reordered", "empty", "truncated", "token limit", "late disconnect"])(
+    "resumes after a %s row or stream without republishing its validated prefix", async failure => {
+      const requests = mockWriter((input, n) => {
+        if (n > 1) return complete(known(input));
+        const output = known(input);
+        if (failure === "late disconnect") return new Response(frame(JSON.stringify(output)) +
+          event({error: {code: 503, status: "UNAVAILABLE", details: [{retryDelay: "0s"}]}}));
+        if (failure === "token limit" || failure === "truncated") {
+          return new Response(frame(JSON.stringify(output).slice(0, -1), failure === "token limit" ? "MAX_TOKENS" : "STOP"));
+        }
+        const [a, b, c] = output.units;
+        const bad = failure === "missing" ? [a, c] : failure === "duplicated" ? [a, a, c] :
+          failure === "reordered" ? [a, c, b] : [a, {...b, text: "  "}, c];
+        return complete({...articles, units: bad});
+      });
+      const chunks = await collect(writeArticle(env, {video: spoken}, signal()));
+      expect(requests[1].input.units[0].id).toBe(["truncated", "token limit", "late disconnect"].includes(failure) ? 3 : 2);
+      expect(requests.slice(1).every(r => r.input.units.every(unit => unit.id > 1))).toBe(true);
+      expect(progress(chunks).map(p => p.completed)).toEqual([0, 1, 2, 3]);
+      for (const expected of ["为什么测两次？", "我记录了“二次”读数。", "我又核对了一次。"])
+        expect(markdown(chunks).split(expected)).toHaveLength(2);
+      expect(ends(chunks)).toHaveLength(1);
   });
 
-  it("preserves the first chapter's completion and never replays visible text when a later stream fails", async () => {
-    const partial = JSON.stringify(last).split(',"recap"')[0];
-    const error = event({error: {code: 503, status: "UNAVAILABLE", message: "test upstream disconnect"}});
-    const fetcher = vi.fn().mockResolvedValueOnce(complete(first)).mockResolvedValueOnce(new Response(frame(partial) + error));
-    vi.stubGlobal("fetch", fetcher);
-    const chunks = [];
+  it("does not lose the unsent tail when a failed batch must be subdivided", async () => {
+    const source = {...spoken, text: Array.from({length: 11}, (_, i) => ">> 唯一发言 " + (i + 1) + "。").join("\n")};
+    const requests = mockWriter((input, n) => {
+      if (n > 1) return complete(echo(input));
+      const output = echo(input);
+      return complete({...output, units: [output.units[0], output.units[6]]});
+    });
+    const chunks = await collect(writeArticle(env, {video: source}, signal()));
+    expect(requests[1].input.units.length).toBeLessThan(10);
+    expect(requests.slice(1).flatMap(r => r.input.units.map(unit => unit.id))).toEqual(
+      Array.from({length: 10}, (_, i) => i + 2));
+    expect(progress(chunks).map(p => p.completed)).toEqual(Array.from({length: 12}, (_, i) => i));
+    expect(markdown(chunks).match(/唯一发言/g)).toHaveLength(11);
+    expect(ends(chunks)).toHaveLength(1);
+  });
+
+  it("keeps stray model Markdown in speech from manufacturing a new chapter", async () => {
+    const source = {...spoken, text: "The source quotes a heading and a paragraph."};
+    mockWriter(input => complete({...articles, units: input.units.map(({id}) => ({
+      id, heading: "原话里的标题", speaker: "", text: "# 另一个标题\n## 伪造的章节\n> ## 引用中的标题",
+    }))}));
+    const chunks = await collect(writeArticle(env, {video: source}, signal()));
+    const article = markdown(chunks);
+    expect(article.match(/^# .+$/gm)).toEqual(["# 现场访谈"]);
+    expect(article.match(/^## .+$/gm)).toEqual(["## 核对读数"]);
+    expect(article).toContain("另一个标题\n\n伪造的章节\n\n引用中的标题");
+    expect(ends(chunks)).toHaveLength(1);
+  });
+
+  it("bounds repeated invalid responses and never reports the final missing source unit as complete", async () => {
+    const requests = mockWriter(input => complete({...articles, units: input.units.slice(0, -1).map(({id}) => transcriptRows[id - 1])}));
+    const chunks: ArticleUpdate[] = [];
     await expect((async () => {
-      for await (const delta of writeArticle(env, {video}, signal())) chunks.push(delta);
+      for await (const chunk of writeArticle(env, {video: spoken}, signal())) chunks.push(chunk);
     })()).rejects.toThrow();
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(chunks.filter(chunk => typeof chunk !== "string")).toEqual([{chapterEnd: true}]);
-    expect(chunks.join("").split(last.body)).toHaveLength(2);
+    expect(ends(chunks)).toHaveLength(0);
+    expect(progress(chunks).at(-1)).toEqual({completed: 2, total: 3});
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.length).toBeLessThan(8);
+    expect(markdown(chunks)).not.toContain(transcriptRows[2].text);
+  });
+
+  it.each([429, 503])("retries transient HTTP %i without duplicating dialogue", async status => {
+    const requests = mockWriter((input, n) => n === 1
+      ? new Response("", {status, headers: {"retry-after": "0"}}) : complete(known(input)));
+    const chunks = await collect(writeArticle(env, {video: spoken}, signal()));
+    expect(requests).toHaveLength(2);
+    expect(progress(chunks).map(p => p.completed)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("retains a completed chapter when the provider permanently rejects the next one", async () => {
+    const requests = mockWriter((input, n) => n === 1 ? complete(echo(input)) : new Response("", {status: 403}));
+    const chunks: ArticleUpdate[] = [];
+    await expect((async () => {
+      for await (const chunk of writeArticle(env, {video}, signal())) chunks.push(chunk);
+    })()).rejects.toThrow();
+    expect(ends(chunks)).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+    const completed = requests[0].input.units.length;
+    expect(progress(chunks).at(-1)).toEqual({completed, total: completed + requests[1].input.units.length});
   });
 });
 
@@ -295,12 +395,12 @@ describe("background 5W1H response failures", () => {
   });
 });
 
-describe("unstructured article streaming", () => {
+describe("explicitly scoped Markdown streaming", () => {
   const clockMarks = [{at: "1:15", firstCue: 1}, {at: "1:15:50", firstCue: 3}];
   it.each([
-    ["ordinary timed captions", {...video, timeline: clockMarks}, "", true],
-    ["a request with a reader constraint", {...video, timeline: clockMarks.map(mark => ({...mark, topic: "观测"}))}, "请保留观测议题。", true],
-    ["the untimed W3C transcript", {...cachedCaptions, videoId: cachedVideoId}, "", false],
+    ["ordinary timed captions", {...video, timeline: clockMarks}, "只讨论测量。", true],
+    ["a request with a reader constraint", {...video, timeline: clockMarks.map(mark => ({...mark, topic: "观测"}))}, "只讨论观测议题。", true],
+    ["the untimed W3C transcript", {...cachedCaptions, videoId: cachedVideoId}, "只总结操作步骤。", false],
   ] as const)("streams source-backed chapter clocks only for %s", async (_description, source, requirements, hasTimes) => {
     const firstSource = "# 观测\n\n## [0:02:37] [取样] 数据口径\n\n**主持人：** 先测";
     const firstExpected = "# 观测\n\n## [取样] 数据口径\n\n**主持人：** 先测";
@@ -344,50 +444,17 @@ describe("unstructured article streaming", () => {
     const expected = raw.replace("## [00:00] 推导", "## 推导");
     vi.stubGlobal("fetch", vi.fn(async () => new Response(Array.from(raw, char => frame(char)).join("") + frame("", "STOP"))));
     let visible = "";
-    for await (const update of writeArticle(env, {video: source}, signal())) {
+    for await (const update of writeArticle(env, {video: source, requirements: "只讨论数学。"}, signal())) {
       if (typeof update === "string") visible += update;
       expect(expected.startsWith(visible)).toBe(true);
     }
     expect(visible).toBe(expected);
   });
 
-  it("applies the interview format to a short unidentified conversation without publisher topics", async () => {
-    const source: Video = {
-      source: "youtube", videoId: "fHsa9Dqm0CU", title: "Field observations",
-      text: "Why do you measure twice?\n>> I compare the readings.",
-    };
-    const question = "# 田野观测\n\n## 重复测量\n\n### 为什么测两次？\n\n**主持人：** 为什么测两次？\n\n";
-    const answer = "**受访者：** 我会比较两次读数。\n\n> 小结：重复测量方便核对。";
-    let upstream!: ReadableStreamDefaultController<Uint8Array>;
-    const response = new Response(new ReadableStream<Uint8Array>({start(c) { upstream = c; }}));
-    const fetcher = vi.fn(async (_url: string, _init: RequestInit) => response);
-    vi.stubGlobal("fetch", fetcher);
-    const article = writeArticle(env, {video: source}, signal());
-
-    upstream.enqueue(encoder.encode(frame(question)));
-    expect(await article.next()).toEqual({done: false, value: question});
-    const payload = JSON.parse(String(fetcher.mock.calls[0][1].body));
-    const instruction: string = payload.systemInstruction.parts[0].text;
-    expect(instruction).toContain("### ");
-    expect(instruction).toContain("第一人称回答");
-    expect(instruction).toMatch(/换人.{0,5}另起一段/);
-    expect(instruction).toContain("**主持人：**");
-    expect(instruction).toMatch(/单人讲解.{0,6}讲解/);
-    expect(instruction).toMatch(/身份不明.{0,8}中性/);
-    expect(JSON.stringify(payload)).not.toMatch(/editorNotes|\b(Jen|John|Mark)\b/);
-    expect(JSON.parse(payload.contents[0].parts[0].text).video).toEqual(source);
-
-    upstream.enqueue(encoder.encode(frame(answer, "STOP")));
-    upstream.close();
-    expect(await article.next()).toEqual({done: false, value: answer});
-    expect((await article.next()).done).toBe(true);
-    expect(fetcher).toHaveBeenCalledOnce();
-  });
-
   it.each([
     ["an explicit reader constraint", video, "只讲最后的数据，限一章。"],
-    ["a video without a publisher outline", {...video, timeline: undefined}, ""],
-    ["timing anchors without publisher topics", {...video, timeline: video.timeline?.map(({at, firstCue}) => ({at, firstCue}))}, ""],
+    ["a video without a publisher outline", {...video, timeline: undefined}, "只讨论最后的数据。"],
+    ["timing anchors without publisher topics", {...video, timeline: video.timeline?.map(({at, firstCue}) => ({at, firstCue}))}, "只讨论最后的数据。"],
   ] as const)("keeps one true text stream for %s", async (_description, source, requirements) => {
     const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
       const payload = JSON.parse(String(init.body));
@@ -399,7 +466,8 @@ describe("unstructured article streaming", () => {
       return new Response(frame("## 章节\n\n") + frame("真实内容。", "STOP"));
     });
     vi.stubGlobal("fetch", fetcher);
-    expect(await collect(writeArticle(env, {video: source, requirements}, signal()))).toEqual(["## 章节\n\n", "真实内容。"]);
+    const chunks = await collect(writeArticle(env, {video: source, requirements}, signal()));
+    expect(markdown(chunks)).toBe("## 章节\n\n真实内容。");
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

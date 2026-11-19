@@ -1,8 +1,8 @@
 # 声稿 · Dialogue Press
 
-把一个公开的 YouTube 视频链接粘贴进写作台。服务端取得该视频的完整字幕后，Gemini 会流式写出中文分章文章。访谈保留实际的提问与回答，单人讲座和教程按讲解内容分节。每章写完即显示小结，同时在后台生成 **5W1H**，可点章节标题旁的按钮查看。[在线写作台](https://vedio2report.tf08202000.workers.dev) · [任务要求与验收记录](tasks/youtube-to-article.md)
+粘贴一个有可读字幕的 YouTube 视频链接，写作台会按原片顺序流式输出完整的中文转写。访谈按发言人排版，保留每轮提问、回答、追问和长回答的自然段。讲座与教程按原讲解顺序展开。每章写完，后台就准备该章的 **5W1H**，点章节标题旁的按钮即可查看。[在线写作台](https://vedio2report.tf08202000.workers.dev) · [任务要求与验收记录](tasks/youtube-to-article.md)
 
-可以先试 3Blue1Brown 的数学短片，也可以直接提交你要读的视频。写作要求留空时从头到尾整理，有特定用途时可以写「面向初学者，分两章解释视频里提出的问题，保留作者举的例子」。首页另有安德森访谈的预置排版样稿。[数学短片《The cube shadow puzzle》](https://youtu.be/U3O1nzSojnc) · [向量课实际生成的两章问答](tasks/vectors-reader-questions.md) · [访谈排版参考](https://msgeanzs2xvq.sg.larksuite.com/docx/IfDxduc1HoUr3Gx81Bul14CLgog)
+写作要求可以留空，也可以填写「给初学者阅读，分两章，保留所有例子和发言」。想试短片可以使用 3Blue1Brown 的立方体投影视频。首页的安德森参考节选展示访谈的阅读排版，实际生成使用提交链接对应的字幕。[数学短片](https://youtu.be/U3O1nzSojnc) · [访谈参考稿](https://msgeanzs2xvq.sg.larksuite.com/docx/IfDxduc1HoUr3Gx81Bul14CLgog)
 
 ## 1. 如何获取和处理 YouTube 字幕
 
@@ -21,19 +21,21 @@
 
 ## 2. 如何调用 Gemini 并实现流式输出
 
-Worker 调用 Gemini 的 `streamGenerateContent?alt=sse`，默认模型为 `gemini-3.1-flash-lite`，可通过服务端变量 `GEMINI_MODEL` 更换。浏览器用一条 POST 响应流读取正文。服务端逐个解码 UTF-8 和 SSE 帧，以 `delta` 发送新片段，页面在下一次绘制时更新文字。章节正文和章末小结来自同一次调用。服务端保存完整章节，发出 `chapter` 事件并安排后台总结，最后用 `done` 标记全文完成。读者停止生成或连接中断时，已写好的章节仍可阅读。[Gemini 客户端](src/worker/gemini.ts) · [浏览器渲染](src/web/main.ts)
+主文章只向 Gemini 发送字幕文本。服务端先为每段连续字幕分配顺序编号，保留该段的原文和起止字幕行。有发布者章节时保留原目录与跳转时间。时间点落在一句发言中间时，在前面最多八条字幕、380 个字符内寻找换人或句子起点。章节的第一句话可能比原目录链接早几秒。普通长片按可靠时间锚点划分，无时间码的长文字稿按连续段落分章。每章再拆成小批次，模型只转写当前批次，上一段原话及少量已显示译文用于衔接半句话、代词和说话人。[字幕分段](src/worker/transcript-plan.ts)
 
-未填写写作要求时，分章取决于字幕材料。带有完整发布者目录的视频按目录顺序逐章生成。普通长片如有至少三个可靠时间锚点、字幕跨度至少 15 分钟，服务端从实际时间锚点选择约 10 分钟或更长的区间，并把不足 3 分钟的尾段合入前章。每章可带前段末尾最多 8 条、480 个字符的字幕，用于理解跨章的追问和代词。其余视频通过一次全文流按话题整理。章节标题只使用来源中可核对的时间；无时间码的文字稿按主题展示。
+Worker 调用 Gemini 的 `streamGenerateContent?alt=sse`，默认模型为 `gemini-3.1-flash-lite`，可用 `GEMINI_MODEL` 更换。上游以结构化流返回字幕编号、译文、说话人及可选小标题。服务端读到一条完整记录，校验编号与顺序后，就用 `delta` 事件把这一段发给浏览器。后续批次仍在生成时，已到达的发言即可阅读。半句接续到上一段，长回答保留自然段。全篇模式的进度来自已通过校验的字幕段数。[生成与续写](src/worker/gemini.ts) · [记录校验与排版](src/worker/transcript-response.ts) · [浏览器渲染](src/web/main.ts)
+
+批次漏段、乱序或提前结束时，从第一个未提交的编号有限重试。若译文引入下一字幕段里的多个专名，或在一串外文产品名中加入原字幕没有的名称，服务端会单独重译可疑的字幕段。只有全片编号都已转写、所有章节都已保存，才发出 `done`。中断时保留已经显示的内容并提示原因。编号能核对源材料的覆盖和顺序，译文是否保留原意还需对照字幕检查。
 
 ## 3. 自然语言要求如何影响文章
 
-「写作要求」选填，最多 2,000 个字符。填写后，服务端在一次主文章调用中分别提供完整字幕和读者要求，使模型可以跨全片选择符合范围的内容。例如，「写给新手，只解释作者给出的第一种方法，用两章教程，每章保留一个原文例子」同时限定了受众、任务、篇幅和材料范围。字幕未提供的例子或事实保留空缺。
+「写作要求」选填，最多 2,000 个字符。留空时走全篇转写。填写受众、语气、语言或「分两章」这类排版要求，仍然处理全片；例如「面向初学者，保留发言人和全部原例，分两章」会将连续材料分配到两章，并把要求提交给模型。服务端用常见中英文表达识别摘要、字数限制、另写简报或限定范围的明确要求，识别到后切换为按要求改写；其余要求随每批字幕交给模型。例如「只讨论产品定价，为产品经理写一份三百字简报」允许选材和压缩。[要求识别](src/worker/transcript-intent.ts) · [写作提示](src/worker/gemini.ts)
 
-系统提示要求模型依据发言组织文章。访谈保留可以在原片找到的提问、回答和追问；讲座保留讲者的论证，教程保留操作顺序。无法确认姓名时使用中性称呼。片头如果只有摘录发言，直接整理这段发言。服务端检查主标题、章节、非空正文和章末小结，再开放章节 5W1H。[写作提示](src/worker/gemini.ts) · [文章结构校验](src/worker/protocol.ts)
+访谈转写保留字幕中的原问题、回答、反问、数字、例子与限定语。优先采用字幕中的明确署名。字幕用 `>>` 标记换人时另起发言段，无法确定身份时使用中性署名。遇到只有回答的片头，就从这段回答开始。单人讲解保持第一人称及原有步骤。
 
 ## 4. 如何实现章节级 5W1H 总结
 
-每篇文章使用一个 Cloudflare Durable Object 保存完整字幕、已完成的文章和章节总结任务。章末小结到达后，服务端确认章节完整，把正文和该章的 5W1H 任务一起保存。后台根据完整视频和当前章节生成总结并缓存，即使页面上没人点击按钮也会执行，正文可继续输出。
+每篇文章使用独立的 Cloudflare Durable Object 保存本次完整字幕、已完成的正文和章节任务。全篇模式下，服务端在一章的最后一段通过校验后，将章节正文和待执行的总结任务一起持久化。后台依据整片字幕、已保存的文章和该章节生成六项结果。后续章节继续转写，读者可以随时展开已写完章节的 5W1H。
 
 点击按钮只读取这一章的状态或结果，请求不带字幕、文章或章节文本。
 
@@ -43,15 +45,14 @@ GET /api/articles/{articleId}/chapters/{chapterId}/summary
 
 准备就绪时返回 HTTP 200 和 `who`、`what`、`when`、`where`、`why`、`how` 六个字符串。任务排队或运行中时返回 HTTP 202 和 `Retry-After`。若模型答复截断或缺少字段，后台会退避重试，最多执行三轮任务，对象重启后也能继续。字幕未交代的事项标为「本章未提及」。[任务调度与缓存](src/worker/session.ts)
 
-面板展开期间，遇到网络中断或临时网关错误会自动重连，只读取该章的状态。用户可以继续读正文，收起面板即停止轮询，再次打开已读章节直接显示六项。后台已终止的任务返回 `SUMMARY_FAILED`，页面提示读者查看章末小结。旧文章缺少预生成结果或已过保存期限时，页面说明需要重新生成文章。[读取与重连](src/web/summary.ts) · [总结面板](src/web/reader.ts)
+面板展开期间，遇到网络中断或临时网关错误会自动重连，只读取该章的状态。用户可以继续读正文，收起面板即停止轮询，再次打开已读章节直接显示六项。后台已终止的任务返回 `SUMMARY_FAILED`，页面仍保留章节正文。旧文章缺少预生成结果或已过保存期限时，页面说明需要重新生成文章。[读取与重连](src/web/summary.ts) · [总结面板](src/web/reader.ts)
 
 ## 5. 主要工程取舍与亮点
 
-- **会议笔记的交互。** Otter 在录制过程中按主题更新 Outline，Google Meet 提供“截至目前的摘要”。本项目把这种交互用于已有字幕的录像，按原片时间组织发言与话题，边写正文边给阶段小结。资料已经齐全，生成按模型实际响应速度进行。每个 5W1H 在后台独立准备，读者决定是否展开。[Otter 官方说明](https://help.otter.ai/hc/en-us/articles/5093228433687-Conversation-Page-Overview) · [Google Meet 官方说明](https://support.google.com/meet/answer/14754931?hl=en)
-- **控制输入成本。** 主文章和总结均使用字幕文本。长片分段时由单次请求处理当前区间，可带少量前文承接句意。普通小结与该章正文共享一次生成调用。后台总结读取完整字幕与已经保存的文章，以保留跨章节语境。逐章预计算会为没有被打开的章节消耗模型配额，换来读者点开已就绪结果时只需读取缓存。若模型返回英文解释，翻译时仅提交六个结果字段。
-- **读者能看到的流式输出。** 公网验收使用真实 Chrome，输入视频并点击生成。脚本在 HTTP 响应结束前测量屏幕上的段落是否在不同绘制帧中多次增长。章节完成后，先保持面板关闭，确认后台已保存首章结果，再点开对照六项内容。[浏览器验收脚本](scripts/verify-deployment.mjs)
-- **上下文有期限。** 每篇文章保留 24 小时，Durable Object alarm 到期清理，读取时也检查有效期。按 IP 限制每分钟 6 次文章生成请求，各 Cloudflare 节点独立计数。章节结果查询使用只读接口。
-- **长视频保留完整性。** 普通视频的字幕正文以 UTF-8 字节数计量，上限为 512 KB。超过上限会明确报错，避免用残缺字幕生成全文。前端通过 DOM 文本节点渲染模型输出，密钥由 Worker 管理。
+- **边读边查。** Otter 会按话题更新 Outline，Google Meet 支持查看“截至目前的摘要”。在这里，读者先看到逐段到达的完整发言，点开某一章才会在面板看到后台准备的六项总结。复制正文会保留章节、小标题和对话段落。[Otter 官方说明](https://help.otter.ai/hc/en-us/articles/5093228433687-Conversation-Page-Overview) · [Google Meet 官方说明](https://support.google.com/meet/answer/14754931?hl=en)
+- **模型成本与等待时间。** 主文章按批次发送字幕以控制单次输出长度，逐章 5W1H 则读取完整字幕以理解跨章背景。全篇转写会比写一份纪要产生更多输出。后台预计算也会为没有被点开的章节消耗配额，结果就绪后，读者展开面板只需读取缓存。
+- **核对读者实际看到的内容。** 浏览器验收检查正文在 HTTP 响应结束前的可见增长、字幕覆盖和各章的 5W1H。长片还可对照开场、中段、收尾的具体发言，检查论据与最后一轮对话是否保留。[浏览器验收脚本](scripts/verify-deployment.mjs)
+- **长文存储。** 服务端接受最多 512 KB 的 UTF-8 字幕，超限会明确提示。长正文按块持久化，每章完成时连同总结队列一起提交。文章与总结保存 24 小时，到期由 Durable Object 清理。按 IP 限制每分钟六次文章生成请求，各 Cloudflare 节点独立计数。[文章会话](src/worker/session.ts)
 
 ## 运行、验证与部署
 
@@ -73,13 +74,13 @@ npm run build
 npx wrangler deploy --dry-run
 ```
 
-在 Cloudflare 启用账号的 workers.dev 子域，在 GitHub Actions 的仓库 secrets 中填写 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` 和 `GEMINI_API_KEY`，如需启用 Supadata，再配置可选 Secret `SUPADATA_API_KEY`。运行 **Deploy Worker**。工作流会先测试和构建，再发布 Worker、绑定加密密钥并执行公网验收。运行摘要记录首屏正文出现时间、可见增长次数和全文耗时。默认验收会生成一篇限定主题的文章，每个已完成章节会自动消耗一次后台总结调用，必要时另有纯文本翻译。[部署工作流](.github/workflows/deploy.yml) · [Worker 配置](wrangler.jsonc)
+在 Cloudflare 启用账号的 workers.dev 子域，在 GitHub Actions 的仓库 secrets 中填写 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN` 和 `GEMINI_API_KEY`，如需启用 Supadata，再配置可选 Secret `SUPADATA_API_KEY`。运行 **Deploy Worker**。工作流会先测试和构建，再发布 Worker、绑定加密密钥并执行公网验收。运行摘要记录首屏正文出现时间、可见增长次数和全文耗时。默认验收会生成全篇转写，每个已完成章节会自动消耗一次后台总结调用，必要时另有纯文本翻译。[部署工作流](.github/workflows/deploy.yml) · [Worker 配置](wrangler.jsonc)
 
-已有部署可使用 Node.js 24 和本机 Chrome 复验。使用 Chromium 时，令 `CHROME_PATH` 指向可执行文件。通过 `--url` 指定要测的链接，`--default` 让写作要求留空，默认没有该标志时要求两章问答。
+已有部署可使用 Node.js 24 和本机 Chrome 复验。使用 Chromium 时，令 `CHROME_PATH` 指向可执行文件。通过 `--url` 指定要测的链接，默认留空写作要求。用 `--adapted` 可单独验收指定范围的改写。
 
 ```sh
 node scripts/verify-deployment.mjs https://vedio2report.tf08202000.workers.dev \
-  --url https://youtu.be/U3O1nzSojnc --default
+  --url https://youtu.be/U3O1nzSojnc
 ```
 
-脚本核对实际视频 ID、正文在响应结束前的可见增长、章末小结和 5W1H。测试某条特定字幕路径时，可添加 `--expect-source published-captions`、`--expect-source youtube` 或 `--expect-source native-api`。使用 `--full` 可额外核对发布者目录的话题覆盖。若要复验字幕错误分支，传入相应链接并使用 `--default --expect-caption-error`，脚本会检查页面显示原因且文章请求数为零。[公网验收脚本](scripts/verify-deployment.mjs)
+脚本核对实际视频 ID、正文在响应结束前的可见增长、完整转写进度和章节 5W1H。测试某条特定字幕路径时，可添加 `--expect-source published-captions`、`--expect-source youtube` 或 `--expect-source native-api`。使用 `--full` 可额外核对发布者目录的话题覆盖。若要复验字幕错误分支，传入相应链接并使用 `--expect-caption-error`，脚本会检查页面显示原因且文章请求数为零。[公网验收脚本](scripts/verify-deployment.mjs)

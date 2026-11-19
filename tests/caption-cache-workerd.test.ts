@@ -79,7 +79,7 @@ it("downloads once for concurrent callers, persists the captions across a restar
   const questions = "采访员问：如何取样？";
   const answers = "采样员答：清晨在河岸采两份水样。";
   const transcript = questions + "\n" + answers;
-  const editions = new Map([["侧重采访提问", "采访开场"], ["侧重实验步骤", "实验步骤"]]);
+  const editions = new Map([["只总结采访提问", "采访开场"], ["只总结实验步骤", "实验步骤"]]);
   const paths: string[] = [];
   const summaryCalls: string[] = [];
   let youtubeOffline = false;
@@ -137,7 +137,7 @@ it("downloads once for concurrent callers, persists the captions across a restar
     expect(running.status).toBe(202);
     expect(await running.json()).toMatchObject({videoId: id, status: "running"});
     expect(paths).toEqual(["www.youtube.com/watch", downloadPath]);
-    const firstResponse = submit(runtime, "articles", id, "侧重采访提问");
+    const firstResponse = submit(runtime, "articles", id, "只总结采访提问");
     release();
     const first = await readArticle(await firstResponse, "采访开场");
     await vi.waitFor(async () => expect(await (await getSummary(first)).json()).toMatchObject({what: "采访开场"}));
@@ -150,7 +150,7 @@ it("downloads once for concurrent callers, persists the captions across a restar
     youtubeOffline = true;
     runtime = startRuntime(upstream, disk);
     expect((await submit(runtime, "captions", id)).status).toBe(200);
-    const second = await readArticle(await submit(runtime, "articles", id, "侧重实验步骤"), "实验步骤");
+    const second = await readArticle(await submit(runtime, "articles", id, "只总结实验步骤"), "实验步骤");
     expect(second).not.toBe(first);
     await vi.waitFor(async () => expect(await (await getSummary(second)).json()).toMatchObject({what: "实验步骤"}));
     expect(await (await getSummary(first)).json()).toMatchObject({what: "采访开场"});
@@ -162,3 +162,64 @@ it("downloads once for concurrent callers, persists the captions across a restar
     await rm(disk, {recursive: true, force: true});
   }
 }, 25_000);
+
+it("streams a 512 kB caption track through SQLite and summarizes a transcript larger than one storage value", async () => {
+  const id = "L0ngC4pt10n";
+  const caption = "A.".repeat(256_000);
+  const translated = "水样已采集。";
+  const expectedLength = translated.length * (caption.length / 2);
+  let inputLength = 0;
+  let nextUnit = 1;
+  const summarized: string[] = [];
+  const runtime = startRuntime(async request => {
+    const endpoint = new URL(request.url);
+    if (endpoint.pathname === "/watch") return player(id, true);
+    if (endpoint.pathname === "/api/timedtext") return Response.json({events: [{segs: [{utf8: caption}]}]});
+    const {contents} = await request.json() as {contents: {parts: {text: string}[]}[]};
+    const material = JSON.parse(contents[0].parts[0].text);
+    if (endpoint.pathname.endsWith(":streamGenerateContent")) {
+      const title = material.units[0].id === 1 ? "第一章" : (material.chapterTitle || "第二章");
+      const units = material.units.map((unit: {id: number; text: string}) => {
+        expect(unit.id).toBe(nextUnit++);
+        inputLength += unit.text.length;
+        return {id: unit.id, heading: "", speaker: "", text: unit.text.replaceAll("A.", translated)};
+      });
+      const text = JSON.stringify({articleTitle: "采样记录", chapterTitle: title, units});
+      const candidate = {content: {parts: [{text}]}, finishReason: "STOP"};
+      return new Response("data: " + JSON.stringify({candidates: [candidate]}) + "\n\n");
+    }
+    expect(material.video.text).toBe(caption);
+    if (material.chapter.id === "ch-2") {
+      expect(material.article).toContain("## 第一章");
+      expect(material.article).toContain("## 第二章");
+      expect(material.article.split(translated).length - 1).toBe(caption.length / 2);
+    }
+    summarized.push(material.chapter.id);
+    const summary = {who: "采样者", what: "采样", when: "未提及", where: "未提及", why: "未提及", how: "未提及"};
+    return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
+  });
+
+  try {
+    const response = await submit(runtime, "articles", id, "分成两章");
+    expect(response.status).toBe(200);
+    let received = 0;
+    let articleId = "";
+    let done;
+    for await (const event of events(response)) {
+      if (event.type === "meta") articleId = event.data.articleId;
+      if (event.type === "error") throw new Error(event.data.message);
+      if (event.type === "delta") received += event.data.text.length;
+      if (event.type === "done") done = event.data;
+    }
+    expect(inputLength).toBe(caption.length);
+    expect(received).toBeGreaterThan(expectedLength);
+    expect(done?.coverage).toEqual({completed: nextUnit - 1, total: nextUnit - 1});
+    expect(done.chapters).toHaveLength(2);
+    await vi.waitFor(async () => {
+      expect(summarized).toEqual(["ch-1", "ch-2"]);
+      expect((await runtime.dispatchFetch(api + "articles/" + articleId + "/chapters/ch-2/summary")).status).toBe(200);
+    }, {timeout: 8000});
+  } finally {
+    await runtime.dispose();
+  }
+}, 45_000);

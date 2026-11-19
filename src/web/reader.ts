@@ -29,18 +29,18 @@ function summaryList(summary: Summary) {
   return dl;
 }
 
-function addSummary(heading: HTMLElement, chapter: Chapter, load: LoadSummary, articleSignal: AbortSignal) {
+function addSummary(heading: HTMLElement, chapterId: string, title: string, load: LoadSummary, articleSignal: AbortSignal) {
   const button = el('button', '5W1H');
   button.type = 'button';
   button.className = 'summary-toggle';
   const box = el('div');
-  box.id = 'summary-' + chapter.id;
+  box.id = 'summary-' + chapterId;
   box.className = 'summary-box';
   box.setAttribute('role', 'region');
   box.setAttribute('aria-live', 'polite');
-  box.setAttribute('aria-label', chapter.title + ' 5W1H 总结');
+  box.setAttribute('aria-label', title + ' 5W1H 总结');
   box.hidden = true;
-  button.setAttribute('aria-label', chapter.title + ' 5W1H 总结');
+  button.setAttribute('aria-label', title + ' 5W1H 总结');
   button.setAttribute('aria-expanded', 'false');
   button.setAttribute('aria-controls', box.id);
   button.dataset.state = 'available';
@@ -62,7 +62,7 @@ function addSummary(heading: HTMLElement, chapter: Chapter, load: LoadSummary, a
     box.setAttribute('aria-busy', 'true');
     box.textContent = '正在读取本章总结…';
     try {
-      const summary = await load(chapter.id, signal, state => {
+      const summary = await load(chapterId, signal, state => {
         if (signal.aborted) return;
         const message = state === 'pending' ? '后台正在整理本章总结，完成后会自动显示。' : '暂时无法读取本章总结，正在自动重连…';
         if (box.textContent !== message) box.textContent = message;
@@ -98,7 +98,7 @@ function renderBlocks(raw: string, target: HTMLElement) {
     const text = paragraph.join(' ');
     if (speaker) {
       p.className = 'speaker-turn';
-      const label = el('strong', speaker + '：');
+      const label = el('strong', speaker);
       label.className = 'speaker-label';
       const speech = el('span');
       inline(speech, text);
@@ -116,7 +116,7 @@ function renderBlocks(raw: string, target: HTMLElement) {
     if (!value) { flush(); list = null; continue; }
     const heading = /^(#{1,6})[ \t]+(\S.*)$/.exec(line.trimEnd());
     const item = /^([-*+]\s+|\d+[.)]\s+)(.+)$/.exec(value);
-    const turn = /^\*\*([^*：:\n]{1,40}?)(?:[：:]\*\*|\*\*\s*[：:])\s*(.*)$/.exec(value);
+    const turn = /^\*\*([^*：:\n]{1,40}?)(?:([：:])\*\*|\*\*\s*([：:]))\s*(.*)$/.exec(value);
     if (heading) {
       flush();
       list = null;
@@ -151,9 +151,9 @@ function renderBlocks(raw: string, target: HTMLElement) {
     } else if (turn) {
       flush();
       list = null;
-      speaker = turn[1].trim();
+      speaker = turn[1].trim() + (turn[2] || turn[3]);
       inSpeech = true;
-      paragraph.push(turn[2]);
+      paragraph.push(turn[4]);
     } else {
       list = null;
       if (inSpeech && value.startsWith('**') && !value.slice(2).includes('**')) flush();
@@ -243,8 +243,9 @@ export function createArticleRenderer(target: HTMLElement, title: HTMLElement, l
         view.lastText = text;
       }
       const chapter = chapters[i];
-      if (chapter && chapter.title === name && !view.hasSummary) {
-        view.heading.after(addSummary(view.heading, chapter, load, articleSignal));
+      const displayName = name.replace(/\*\*/g, '');
+      if (chapter && chapter.title.replace(/\*\*/g, '') === displayName && !view.hasSummary) {
+        view.heading.after(addSummary(view.heading, chapter.id, displayName, load, articleSignal));
         view.hasSummary = true;
       }
     }

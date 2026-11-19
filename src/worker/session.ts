@@ -2,12 +2,54 @@ import type { Video } from './captions'
 import { preparedSource } from './caption-cache'
 import { summarize, TransientError, writeArticle } from './gemini'
 import { ApiError, chapterHeadings, extractChapters, failure, json, requireChapterRecap } from './protocol'
-import type { Bindings, Summary } from './protocol'
+import type { Bindings, Summary, TranscriptCoverage } from './protocol'
+import { requestsEditorialAdaptation } from './transcript-intent'
 
 const lifetime = 24 * 60 * 60 * 1000
 const encoder = new TextEncoder()
 const summaryTimeout = 90_000
 const maxAttempts = 3
+// Each block fits comfortably inside a SQLite-backed Durable Object value even
+// for multibyte text. Published blocks are immutable, so an alarm can read the
+// snapshot named by its manifest while another chapter is being appended.
+const blockSize = 64 * 1024
+interface ArticleManifest {blocks: number; length: number}
+type StoredArticle = string | ArticleManifest
+
+async function saveArticle(tx: DurableObjectTransaction, article: string) {
+  if (article.length <= blockSize) {
+    await tx.put('article', article)
+    return
+  }
+  const previous = await tx.get<StoredArticle>('article')
+  const manifest = typeof previous === 'object' ? previous : {blocks: 0, length: 0}
+  while (manifest.length < article.length) {
+    let end = Math.min(manifest.length + blockSize, article.length)
+    const last = article.charCodeAt(end - 1)
+    if (end < article.length && last >= 0xd800 && last <= 0xdbff) end--
+    await tx.put('article/' + manifest.blocks, article.slice(manifest.length, end))
+    manifest.blocks++
+    manifest.length = end
+  }
+  await tx.put('article', manifest)
+}
+
+async function readArticle(storage: DurableObjectStorage): Promise<string | undefined> {
+  const stored = await storage.get<StoredArticle>('article')
+  if (typeof stored !== 'object') return stored
+  const blocks: string[] = []
+  // Durable Objects permit up to 128 keys per get().
+  for (let start = 0; start < stored.blocks; start += 128) {
+    const keys = Array.from({length: Math.min(128, stored.blocks - start)}, (_, i) => 'article/' + (start + i))
+    const values = await storage.get<string>(keys)
+    for (const key of keys) {
+      const block = values.get(key)
+      if (typeof block !== 'string') throw new ApiError(502, '本章总结的原文上下文不完整。')
+      blocks.push(block)
+    }
+  }
+  return blocks.join('')
+}
 // Chapters are committed in order. One cursor bounds execution to one inference
 // per article at a time, even across eviction, alarm redelivery and retries.
 interface SummaryQueue {
@@ -93,23 +135,42 @@ export class ArticleSession {
     let nextLine = 0
     let headingsSeen = 0
     let published = 0
+    const fullTranscript = !requestsEditorialAdaptation(requirements)
+    let coverage: TranscriptCoverage | undefined
+    let publishedUnits = 0
+    let publishedLength = 0
     const checkpoint = async (prefix: string) => {
       const chapter = extractChapters(prefix).at(-1)!
-      requireChapterRecap(chapter)
-      await this.publish(prefix, published + 1, expiresAt)
+      if (fullTranscript) {
+        if (!coverage || coverage.completed <= publishedUnits || chapter.id !== 'ch-' + (published + 1))
+          throw new ApiError(502, '本章转写尚未完整。')
+        publishedUnits = coverage.completed
+      } else requireChapterRecap(chapter)
+      await this.publish(prefix, published + 1, expiresAt, coverage)
+      publishedLength = prefix.length
       published++
       return {id: chapter.id, title: chapter.title}
     }
     for await (const text of writeArticle(this.env, {video, requirements}, signal)) {
-      // A separate, successfully finished topic request has a confirmed boundary
-      // even when the next upstream request has not produced a heading yet.
       if (typeof text !== 'string') {
-        yield ['chapter', await checkpoint(article)]
+        if ('coverage' in text) {
+          const {completed, total} = text.coverage
+          if (!fullTranscript || !Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(completed) ||
+              completed > total || (coverage ? total !== coverage.total || completed !== coverage.completed + 1 : completed !== 0))
+            throw new ApiError(502, '字幕转写进度异常，请重新生成。')
+          coverage = {completed, total}
+          yield ['coverage', coverage]
+        } else {
+          // A successfully finished topic has a confirmed boundary before the
+          // next upstream request has produced a heading.
+          yield ['chapter', await checkpoint(article)]
+        }
         continue
       }
+      if (fullTranscript && !coverage) throw new ApiError(502, '缺少待转写字幕的范围。')
       article += text
-      if (article.length > 100_000) throw new ApiError(502, '生成文章过长，请缩小范围。')
       yield ['delta', {text}]
+      if (fullTranscript) continue
       // A heading can be split across deltas. Only examine lines whose newline
       // has arrived, retaining the unfinished line's starting offset.
       const newline = text.lastIndexOf('\n')
@@ -122,19 +183,22 @@ export class ArticleSession {
       }
       nextLine = end
     }
+    if (fullTranscript && (!coverage || publishedUnits !== coverage.total || publishedLength !== article.length))
+      throw new ApiError(502, '部分字幕尚未完成转写，请重新生成。')
     const chapters = extractChapters(article)
     const remaining = chapters.slice(published)
     for (const chapter of remaining) requireChapterRecap(chapter)
     if (remaining.length) await this.publish(article, chapters.length, expiresAt)
     for (const {id, title} of remaining) yield ['chapter', {id, title}]
-    yield ['done', {chapters: chapters.map(({id, title}) => ({id, title}))}]
+    yield ['done', {chapters: chapters.map(({id, title}) => ({id, title})), ...(coverage && {coverage})}]
   }
 
-  private async publish(article: string, count: number, expiresAt: number) {
+  private async publish(article: string, count: number, expiresAt: number, coverage?: TranscriptCoverage) {
     await this.state.storage.transaction(async tx => {
       const queue = await tx.get<SummaryQueue>('queue')
       if (!queue || expiresAt <= Date.now()) throw new ApiError(404, '文章已过期。')
-      await tx.put('article', article)
+      await saveArticle(tx, article)
+      if (coverage) await tx.put('coverage', coverage)
       queue.published = count
       await saveQueue(tx, queue, expiresAt)
     })
@@ -151,12 +215,12 @@ export class ArticleSession {
     // this endpoint cannot restart a finished task, regardless of its storage version.
     if (values.has(failed)) return json({
       code: 'SUMMARY_FAILED',
-      error: '本章的 5W1H 未能生成。你可以继续阅读本章正文和章末小结。',
+      error: '本章的 5W1H 未能生成。你可以继续阅读本章正文。',
       reason: values.get(failed),
     }, 502)
     const queue = values.get('queue') as SummaryQueue | undefined
     if (!queue) {
-      const article = await this.state.storage.get<string>('article')
+      const article = await readArticle(this.state.storage)
       if (article && extractChapters(article).some(chapter => chapter.id === id))
         throw new ApiError(409, '这篇旧文章没有预生成此章总结，请重新生成文章。')
     }
@@ -200,10 +264,10 @@ export class ArticleSession {
     if (!claim) return
 
     const id = 'ch-' + claim.number
-    const [video, article] = await Promise.all([storage.get<Video>('video'), storage.get<string>('article')])
-    const chapter = article && extractChapters(article).find(chapter => chapter.id === id)
     let result: Summary
     try {
+      const [video, article] = await Promise.all([storage.get<Video>('video'), readArticle(storage)])
+      const chapter = article && extractChapters(article).find(chapter => chapter.id === id)
       if (!video?.text || !article || !chapter) throw new ApiError(502, '本章总结的原文上下文不完整。')
       const deadline = Math.max(1, Math.min(summaryTimeout, session.expiresAt - Date.now()))
       result = await summarize(this.env, video, article, chapter, AbortSignal.timeout(deadline))
