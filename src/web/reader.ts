@@ -92,6 +92,7 @@ function attachSummaryControl(
       panel.replaceChildren(header, renderSummaryTable(data))
       loaded = true
       button.dataset.state = 'loaded'
+      button.textContent = '5W1H ✓'
     } catch (error) {
       if (signal.aborted) return
       button.dataset.state = 'error'
