@@ -60,17 +60,20 @@ function boundaries(video: Video, marks: NonNullable<Video['timeline']>): Mark[]
 
 const speakerStart = /^(?:>>|(?:\*\*)?[\p{L}][\p{L}\p{M} .’'-]{0,28}[：:])/u
 const sentenceEnd = /[.!?。！？][”’"'）)»]*$/u
+const questionEnd = /[?？][”’"'）)»]*$/u
 const independentStart = /^[“‘"'（(¿¡]*[\p{Lu}\p{Lt}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u
 
 // The timestamp is the publisher's chapter link. It can point into the middle
 // of a question. Move the *text* cut back to its nearby onset, keeping the
 // original link and original cue numbers, even when the onset is mid-cue.
-function alignChapterStarts(lines: string[], marks: Mark[]) {
+function alignChapterStarts(lines: string[], marks: Mark[], mode: TranscriptMode) {
   return marks.map((mark, index) => {
     if (!index) return mark
     const current = lines[mark.firstCue - 1].trim()
-    if (speakerStart.test(current) ||
-        (sentenceEnd.test(lines[mark.firstCue - 2].trim()) && independentStart.test(current))) return mark
+    const previous = lines[mark.firstCue - 2].trim()
+    const speaker = current.match(speakerStart)?.[0]
+    const afterQuestion = mode === 'edited' && mark.topic && speaker && questionEnd.test(previous) && !questionEnd.test(current)
+    if (!afterQuestion && (speaker || (sentenceEnd.test(previous) && independentStart.test(current)))) return mark
 
     let sentence: {firstCue: number; offset: number} | undefined
     let chars = 0
@@ -80,8 +83,8 @@ function alignChapterStarts(lines: string[], marks: Mark[]) {
       chars += line.length
       if (chars > maxUnit) break
       const marker = line.lastIndexOf('>>')
-      if (marker >= 0 || speakerStart.test(line.trimStart()))
-        return {...mark, firstCue: cue, offset: Math.max(marker, 0)}
+      const label = line.trimStart().match(speakerStart)?.[0]
+      if (afterQuestion && marker < 0 && label === speaker) return mark
 
       if (!sentence) {
         // Some captions put a full stop and the start of the next sentence on
@@ -93,6 +96,10 @@ function alignChapterStarts(lines: string[], marks: Mark[]) {
         if (!sentence && sentenceEnd.test(lines[cue - 2].trim()) && independentStart.test(line.trimStart()))
           sentence = {firstCue: cue, offset: 0}
       }
+      // At a marked reply, take only the adjacent question. Earlier sentences
+      // in the same speaker's turn can still belong to the previous chapter.
+      if (afterQuestion && sentence && sentence.offset > marker) return {...mark, ...sentence}
+      if (marker >= 0 || label) return {...mark, firstCue: cue, offset: Math.max(marker, 0)}
     }
     return sentence ? {...mark, ...sentence} : mark
   })
@@ -176,7 +183,7 @@ function batchUnits(units: TranscriptUnit[], mode: TranscriptMode) {
     if (mode === 'edited' && end < units.length) {
       const earliest = first + Math.ceil((end - first) * 0.75)
       for (let i = end; i >= earliest; i--) {
-        if (speakerStart.test(units[i].text) && !/[?？]["'”’）)]*$/u.test(units[i - 1].text)) {
+        if (speakerStart.test(units[i].text) && !questionEnd.test(units[i - 1].text)) {
           end = i
           break
         }
@@ -213,7 +220,7 @@ export function planTranscript(video: Video, chapterCount?: number, mode: Transc
   const lines = video.text.split(/\r?\n/)
   const marks = timeline(video, lines.length)
   const anchors = boundaries(video, marks)
-  const sections = alignChapterStarts(lines, anchors)
+  const sections = alignChapterStarts(lines, anchors, mode)
   const chapterLinks = new Map<number, Mark>()
   let groups: TranscriptUnit[][] = []
   let firstId = 1

@@ -73,6 +73,34 @@ describe('full transcript source coverage', () => {
     expect(chapters[1].batches[0][0].text).toBe('>> My next question concerns\na second measurement. Does the\nsame method work here?')
   })
 
+  it('keeps the adjacent question with a publisher-marked reply in the edited interview', () => {
+    const video = {...base, text: [
+      'Welcome back.', '>> We have discussed the agenda. What did you', 'learn in the pilot?', '>> We changed our design.',
+    ].join('\n'), timeline: [{firstCue: 1, at: '0:00', topic: 'Agenda'}, {firstCue: 4, at: '1:51', topic: 'Pilot'}]}
+    const edited = planTranscript(video, undefined, 'edited')
+    expect(edited.map(ch => [ch.at, ch.topic])).toEqual([['0:00', 'Agenda'], ['1:51', 'Pilot']])
+    expect(edited[0].batches.flat().at(-1)?.text).toBe('>> We have discussed the agenda.')
+    expect(edited[1].batches.flat()).toEqual([
+      {id: 3, firstCue: 2, lastCue: 3, text: 'What did you\nlearn in the pilot?'},
+      {id: 4, firstCue: 4, lastCue: 4, text: '>> We changed our design.'},
+    ])
+    expect(compact(edited.flatMap(ch => ch.batches.flat().map(u => u.text)).join(''))).toBe(compact(video.text))
+    expect(check(video).chapters[1].batches[0][0].firstCue).toBe(4)
+  })
+
+  it.each([
+    ['an unmarked continuation', ['Intro.', 'What changed?', 'Nobody knows.']],
+    ['the same named speaker', ['Intro.', 'Jen: What changed?', 'Jen: Let me explain.']],
+    ['a second question', ['Intro.', 'What changed?', '>> Who wants to go first?']],
+    ['a question with a distant onset', ['Intro.', '>> What are', ...Array(9).fill('some further details about'), 'the pilot?', '>> We learned a lot.']],
+  ] as const)('preserves the publisher cut for %s', (_, lines) => {
+    const video = {...base, text: lines.join('\n'), timeline: [
+      {firstCue: 1, at: '0:00', topic: 'Opening'}, {firstCue: lines.length, at: '1:51', topic: 'Discussion'},
+    ]}
+    const edited = planTranscript(video, undefined, 'edited')
+    expect(edited[1].batches[0][0].firstCue).toBe(lines.length)
+  })
+
   it('can start a timed chapter at a sentence inside a shared cue without losing either half', () => {
     const video = {...base, text: [
       'Start here.', 'We checked it. Next I want to ask', 'about your second', 'measurement?', '>> I counted twice.',

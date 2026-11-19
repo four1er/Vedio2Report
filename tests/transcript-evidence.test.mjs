@@ -37,9 +37,10 @@ describe('article generation acceptance', () => {
 
   it('checks that the actual archived source survives the unit plan', async () => {
     const meta = {videoId: 'xRh2sVcNXQ8', source: 'archived-youtube', mode: 'edited', cueCount: 2801, lastCaptionSeconds: 4866};
-    const count = await archiveUnitCount(meta);
-    expect(count).toBeGreaterThan(1);
-    expect(await archiveUnitCount({...meta, mode: 'verbatim'})).toBe(count);
+    // The editorial cut keeps the adjacent question with its answer at 1:51.
+    // The verbatim cut follows the original subtitle grouping.
+    expect(await archiveUnitCount(meta)).toBe(373);
+    expect(await archiveUnitCount({...meta, mode: 'verbatim'})).toBe(372);
     expect(await archiveUnitCount({...meta, source: 'youtube'})).toBeUndefined();
   });
 

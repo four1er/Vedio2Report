@@ -66,7 +66,15 @@ function untranslatedTitle(title: string) {
 }
 
 interface Speech {speaker: string; text: string}
-interface WireUnit extends Speech {id: number; through?: number; heading: string; turns?: Speech[]}
+interface TopicStart {kind: 'question' | 'subject' | 'requested'; evidence: string; requirement?: string}
+interface WireUnit extends Speech {
+  id: number
+  through?: number
+  heading: string
+  paragraphStart?: boolean
+  topicStart?: TopicStart
+  turns?: Speech[]
+}
 interface TranslatedUnit extends WireUnit {through: number}
 
 const speakerLabel = /^(?:>>\s*)?(?:\*\*)?([\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*(?:[ \t]+[\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*){0,3}|[\p{Script=Han}·]{1,10})(?:\*\*)?\s*[：:]/u
@@ -206,7 +214,17 @@ function validateUnit(value: WireUnit | null, expected: TranscriptUnit[], offset
   validateNames(source.id, translated, source.text, expected[after])
   if (!edited && sourceLength >= 100 && translatedLength < sourceLength * 0.08)
     throw new TranscriptFormatError('字幕段 ' + source.id + ' 的译文明显过短。')
-  return {id: source.id, through, heading: singleLine(value.heading).replace(/^#+\s*/u, ''), ...first, turns}
+  const topic = value.topicStart
+  const evidence = typeof topic?.evidence === 'string' ? singleLine(topic.evidence) : ''
+  // A later question in the same group cannot head the paragraph that precedes it.
+  const opening = covered.find(unit => !canOmit(unit)) ?? firstSource
+  const grounded = edited && evidence && singleLine(opening.text).includes(evidence) &&
+    (topic?.kind === 'subject' || topic?.kind === 'question' || topic?.kind === 'requested')
+  return {
+    id: source.id, through, heading: singleLine(value.heading).replace(/^#+\s*/u, ''), ...first, turns,
+    ...(edited && typeof value.paragraphStart === 'boolean' && {paragraphStart: value.paragraphStart}),
+    ...(grounded && {topicStart: {...topic, evidence}}),
+  }
 }
 
 // Gemini orders titles before subtitle records. Only complete JSON objects may
@@ -227,7 +245,11 @@ export class TranscriptResponse {
   articleTitle = ''
   chapterTitle = ''
   constructor(private expected: TranscriptUnit[], private defaultChinese: boolean, readonly edited = false,
-    private titlesToPublish = {article: true, chapter: true}) {}
+    private titlesToPublish = {article: true, chapter: true}, readonly requirements = '') {}
+
+  sourcesFor(unit: TranslatedUnit) {
+    return this.expected.slice(unit.id - this.expected[0].id, unit.through - this.expected[0].id + 1)
+  }
 
   *append(chunk: string): Generator<TranslatedUnit> {
     this.raw += chunk
@@ -291,14 +313,26 @@ export class TranscriptResponse {
   }
 }
 
+export interface EditorialTopic {
+  heading: string
+  anchor: string
+  question?: string
+  answerSpeaker?: string
+}
+
 export interface TranscriptLayout {
   chapterTitle: string
   speaker: string
   heading: string
   lastText: string
   rejectedSpeaker?: string
-  answerSpeaker?: string
+  topic?: EditorialTopic
 }
+
+const endsQuestion = /[?？][”’"'）)]*$/u
+const endsSentence = /[。！？.!?…][”’"')）]*$/u
+// An expressly announced change also works when a model omits topic metadata.
+const announcesTopic = /^(?:(?:so[, ]+)?(?:on|(?:let['’]s|now we(?:'ll| will)?) (?:move on|turn) to) (?:the |a )?(?:other|next|different) (?:topic|subject)\b|(?:换个话题|下一个话题))/iu
 
 export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUnit, response: TranscriptResponse,
   layout: TranscriptLayout, at?: string, firstArticle = source.id === 1) {
@@ -311,11 +345,10 @@ export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUni
     layout.chapterTitle = title
     markdown += '\n\n## ' + (at ? '[' + at + '] ' : '') + title
   }
-  // When an edited range starts with an empty courtesy, the first substantive
-  // speaker can belong to a later cue. Don't give their words to the greeter.
-  const silentLead = response.edited && unit.through > unit.id && canOmit(source)
-  const markedTurn = !silentLead && source.text.startsWith('>>')
-  const sourceLabel = !silentLead && speakerLabel.exec(source.text)?.[1]
+  const covered = response.edited ? response.sourcesFor(unit) : [source]
+  const opening = covered.find(item => !canOmit(item)) ?? source
+  const markedTurn = opening.text.startsWith('>>')
+  const sourceLabel = speakerLabel.exec(opening.text)?.[1]
   let firstSpeaker = sourceLabel || unit.speaker
   if (markedTurn && !sourceLabel && (!firstSpeaker || firstSpeaker.toLowerCase() === layout.speaker.toLowerCase())) {
     layout.rejectedSpeaker = layout.speaker
@@ -327,35 +360,56 @@ export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUni
     layout.rejectedSpeaker = undefined
   }
   const initialSpeaker = firstSpeaker || layout.speaker
-  const questionEnd = /[?？][”’"'）)]*$/u
-  const beginsAnswer = (name: string) => Boolean(name && name !== '未署名发言人' && layout.speaker &&
-    name !== layout.speaker && questionEnd.test(layout.lastText))
-  // In a Q&A, several facets of the same person's answer can arrive in
-  // different records or requests. Keep the question's subheading over them.
-  const continuingAnswer = !markedTurn && initialSpeaker === layout.answerSpeaker
-  const sameAnswer = response.edited && !first && !questionEnd.test(unit.text) && !questionEnd.test(source.text)
-    && (beginsAnswer(initialSpeaker) || continuingAnswer)
+  const proposal = unit.topicStart
+  const previous = layout.topic
+  const differentVoice = initialSpeaker !== layout.speaker || (markedTurn && !sourceLabel)
+  const questionInSource = covered.some(item => /[?？]/u.test(item.text))
+  const asksQuestion = proposal?.kind === 'question' || (initialSpeaker && endsQuestion.test(unit.text) && questionInSource)
+  const firstQuestion = asksQuestion && !previous?.question
+  const newQuestion = proposal?.kind === 'question' && (!previous?.question || (previous.answerSpeaker !== undefined &&
+    differentVoice && (initialSpeaker !== previous.answerSpeaker || initialSpeaker === '未署名发言人')))
+  const announced = announcesTopic.test(opening.text.replace(speakerLabel, '').replace(/^>>\s*/u, '').trim())
+  const switchesChapter = first && previous?.answerSpeaker !== undefined && differentVoice
+  const newTopic = announced || (proposal?.kind === 'subject' && (!previous?.question || switchesChapter))
+  const requested = proposal?.kind === 'requested' && typeof proposal.requirement === 'string' &&
+    Boolean(proposal.requirement.trim()) && response.requirements.includes(proposal.requirement.trim())
   const heading = unit.heading.trim()
-  const newSubject = Boolean(heading && heading !== title && heading !== layout.heading && !sameAnswer)
+  const chapterAsksQuestion = first && asksQuestion && endsQuestion.test(layout.chapterTitle)
+  const distinct = heading !== layout.chapterTitle && heading !== layout.heading && heading !== previous?.heading
+  const newSubject = Boolean(heading && (requested || (distinct &&
+    (!response.edited || (!chapterAsksQuestion && (!previous || newQuestion || newTopic))))))
   if (newSubject) {
     layout.heading = heading
     markdown += '\n\n### ' + heading
   }
-  let startParagraph = first || newSubject || markedTurn
+  if (response.edited && (!previous || firstQuestion || newQuestion || newTopic || (requested && newSubject))) {
+    layout.topic = {
+      heading: layout.heading,
+      anchor: proposal?.evidence || singleLine(opening.text).slice(0, 240),
+      ...(firstQuestion || newQuestion ? {question: unit.text.slice(-320)} :
+        requested && {question: previous?.question, answerSpeaker: previous?.answerSpeaker}),
+    }
+  }
+  let startParagraph = first || newSubject || (markedTurn && (!response.edited || differentVoice))
   for (const turn of [unit, ...(unit.turns ?? [])]) {
     const speaker = (turn === unit ? firstSpeaker : turn.speaker) || layout.speaker
     const labelSpeaker = Boolean(speaker && (startParagraph || speaker !== layout.speaker || (response.edited && turn !== unit)))
-    // An unfinished sentence may continue across subtitle units or batches.
-    if (startParagraph || labelSpeaker || /[。！？.!?…][”’"')）]*$/u.test(layout.lastText))
+    const paragraph = unit.paragraphStart ?? endsSentence.test(layout.lastText)
+    if (startParagraph || labelSpeaker || paragraph)
       markdown += '\n\n'
-    else if (/[\p{Script=Latin}\d]$/u.test(layout.lastText) && /^[\p{Script=Latin}\d]/u.test(turn.text))
+    else if (/[\p{Script=Latin}\d][.!?,:;”’"')]*$/u.test(layout.lastText) && /^[\p{Script=Latin}\d]/u.test(turn.text))
       markdown += ' '
     if (labelSpeaker) markdown += '**' + speaker + '：** '
     markdown += turn.text
-    if (response.edited) {
-      if (questionEnd.test(turn.text)) layout.answerSpeaker = undefined
-      else if (beginsAnswer(speaker)) layout.answerSpeaker = speaker
-      else if (speaker !== layout.speaker || (markedTurn && turn === unit)) layout.answerSpeaker = undefined
+    // A question can begin on a later turn in the final group of a chapter.
+    // It governs the next answer even if no subheading accompanies the question.
+    if (response.edited && layout.topic && turn !== unit && questionInSource && endsQuestion.test(turn.text) &&
+        (speaker !== layout.speaker || speaker === '未署名发言人')) {
+      layout.topic = {heading: layout.heading, anchor: singleLine(covered.at(-1)!.text).slice(0, 240),
+        question: turn.text.slice(-320)}
+    } else if (layout.topic?.question && layout.topic.answerSpeaker === undefined &&
+        !(turn === unit && (firstQuestion || newQuestion))) {
+      layout.topic.answerSpeaker = speaker
     }
     layout.speaker = speaker
     layout.lastText = turn.text

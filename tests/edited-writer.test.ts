@@ -101,6 +101,22 @@ describe('source-grounded edited articles', () => {
     expect(article.chapters()).toBe(1)
   })
 
+  it('passes an open question across a publisher chapter cut without repeating a subheading over the answer', async () => {
+    const video = {...base, text: 'Maya: What did the sensor measure?\nFirst I used two sensors.\nThey differed by two degrees.',
+      timeline: [{at: '0:00', firstCue: 1, topic: 'Question'}, {at: '1:00', firstCue: 2, topic: 'Results'}]}
+    const requests = mock(input => {
+      const first = input.units[0].id
+      return first === 1
+        ? complete([group(1, 1, '测出了什么？', 'Maya', '测量结果')])
+        : complete([group(first, input.units.at(-1)!.id, '两个传感器测出了两度偏差。', 'Leo', '对比传感器')])
+    })
+    const article = track()
+    await article.read(video)
+    expect(requests[1]).toMatchObject({previousTopic: {question: '测出了什么？'}})
+    expect(article.markdown().match(/^### .+$/gm)).toEqual(['### 测量结果'])
+    expect(article.chapters()).toBe(2)
+  })
+
   it('recovers from successive title, speaker-boundary and range errors by isolating one unit', async () => {
     const video = {...base, text: 'Maya: Why ask twice?\nLeo: I compared the cost.\nThe change was small.\nOnly in good weather.'}
     const requests = mock((input, n) => {
