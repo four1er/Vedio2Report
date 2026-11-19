@@ -48,6 +48,24 @@ it.each(['{"who":', '<html>gateway</html>'])('recovers an unreadable HTTP 200 wi
   expect(status.mock.calls).toEqual([['reconnecting']]);
 });
 
+it('shows when a deferred summary will be checked and waits the full Retry-After before its next GET', async () => {
+  const get = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(Response.json({status: 'pending'}, {status: 202, headers: {'Retry-After': '42000'}}))
+    .mockResolvedValueOnce(Response.json(saved));
+  vi.stubGlobal('fetch', get);
+  const status = vi.fn();
+  const nextCheckAt = Date.now() + 42_000_000;
+  const result = loadSummary('article-id', 'ch-2', new AbortController().signal, status);
+  await vi.advanceTimersByTimeAsync(41_999_999);
+  expect(status.mock.calls).toEqual([[{nextCheckAt}]]);
+  expect(get).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(await result).toEqual(saved);
+  expect(get).toHaveBeenCalledTimes(2);
+  expect(get.mock.calls[1][1]?.method ?? 'GET').toBe('GET');
+  expect(get.mock.calls[1][1]?.body).toBeUndefined();
+});
+
 it('reports a well-formed but incomplete saved result', async () => {
   const get = vi.fn().mockResolvedValueOnce(Response.json({who: saved.who}));
   vi.stubGlobal('fetch', get);

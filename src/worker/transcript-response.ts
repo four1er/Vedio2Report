@@ -54,8 +54,55 @@ function label(value: unknown, name: string) {
   return clean
 }
 
+// A model can copy the source video title even when it edits all dialogue in
+// Chinese. Leave short proper names, model numbers and acronym lists intact.
+function untranslatedTitle(title: string) {
+  if (/\p{Script=Han}/u.test(title)) return false
+  const words = title.match(/[a-z]+/giu) ?? []
+  const ordinary = words.filter(word => /[a-z]/u.test(word))
+  return ordinary.length >= 2 && words.length >= 3 &&
+    (words.some(word => /^(?:a|an|the|and|or|on|of|in|to|vs|how|what|why|with|will|are|is)$/iu.test(word)) ||
+      (ordinary.length >= 4 && /\b[a-z]{3,}\b/u.test(title)) || ordinary.length >= 6)
+}
+
 interface Speech {speaker: string; text: string}
-interface TranslatedUnit extends Speech {id: number; heading: string; turns?: Speech[]}
+interface WireUnit extends Speech {id: number; through?: number; heading: string; turns?: Speech[]}
+interface TranslatedUnit extends WireUnit {through: number}
+
+const speakerLabel = /^(?:>>\s*)?(?:\*\*)?([\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*(?:[ \t]+[\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*){0,3}|[\p{Script=Han}·]{1,10})(?:\*\*)?\s*[：:]/u
+
+// An empty edit is more consequential than combining several cues in prose.
+// Only discard a source unit when *all* remaining words are a known filler,
+// greeting, production annotation or sign-off. A standalone yes/no can answer
+// a real question, and a number or name can be substantive on its own.
+const annotation = /\[(?:music|applause|laughter|inaudible|silence|音乐|掌声|笑声|听不清)\]|【(?:音乐|掌声|笑声|听不清)】/giu
+const hesitation = /\b(?:um+|uh+|erm+|hmm+|ahem|you know|i mean)\b/giu
+const politeReaction = /^(?:oh[,，]?\s+(?:fantastic|great|nice|wonderful)|(?:噢|哦)[，, ]*太好了)[.。!！\s]*$/iu
+const greeting = /\b(?:hello(?: everyone)?|hi(?: everyone)?|goodbye(?: everyone)?|bye|welcome back|let['’]s get started|can you hear me)\b/giu
+const thankYou = /\b(?:thanks|thank you)(?: (?:all|everyone|so much|very much))?(?: for (?:joining(?: us)?(?: today)?|listening|watching|having me(?: here)?))?\b/giu
+const signOff = /\b(?:please )?(?:like and subscribe|subscribe to (?:our|the) channel|hit the subscribe button)\b/giu
+const chineseCourtesy = /嗯+|呃+|额+|啊+|咳咳|大家好|大家再见|再见|欢迎回来|感谢(?:大家)?(?:收看|收听|观看|参与)|谢谢(?:大家)?(?:收看|收听|观看|参与)?|能听见我吗/gu
+
+function canOmit(source: TranscriptUnit) {
+  const text = source.text.trim().replace(speakerLabel, '').replace(/^>>\s*/u, '')
+  return politeReaction.test(text) || !text.replace(annotation, '').replace(hesitation, '').replace(greeting, '')
+    .replace(thankYou, '').replace(signOff, '').replace(chineseCourtesy, '').replace(/[\s\p{P}]/gu, '')
+}
+
+// A substantive >> opens a new turn, even between two declarations. A
+// positively identified same speaker can continue across a repeated source label.
+function minimumTurns(units: TranscriptUnit[]) {
+  let count = 0, previousName = ''
+  for (const unit of units) {
+    if (canOmit(unit)) continue
+    const name = speakerLabel.exec(unit.text)?.[1].toLowerCase()
+    const marked = unit.text.startsWith('>>')
+    if (!count || (name && previousName && name !== previousName) ||
+        (marked && (!name || name !== previousName))) count++
+    if (name || marked) previousName = name || ''
+  }
+  return count
+}
 
 function speech(value: Speech | null, id: number, needsSpeaker: boolean): Speech {
   if (typeof value?.speaker !== 'string' || typeof value.text !== 'string')
@@ -116,14 +163,36 @@ function isEnglishNarration(text: string) {
   return new Set(words ?? []).size >= 3
 }
 
-function validateUnit(value: TranslatedUnit | null, source: TranscriptUnit, next: TranscriptUnit | undefined,
-  defaultChinese: boolean): TranslatedUnit {
-  if (value?.id !== source.id || typeof value.heading !== 'string' ||
+function validateUnit(value: WireUnit | null, expected: TranscriptUnit[], offset: number, defaultChinese: boolean,
+  edited: boolean): TranslatedUnit {
+  const firstSource = expected[offset]
+  const through = edited ? value?.through : firstSource.id
+  if (value?.id !== firstSource.id || typeof through !== 'number' || !Number.isSafeInteger(through) ||
+      through < firstSource.id || through > expected[expected.length - 1].id || typeof value.heading !== 'string' ||
       (value.turns !== undefined && !Array.isArray(value.turns)))
-    throw new TranscriptFormatError('转写遗漏或打乱了字幕段 ' + source.id + '。')
+    throw new TranscriptFormatError('转写遗漏或打乱了字幕段 ' + firstSource.id + '。')
 
+  const after = offset + through - firstSource.id + 1
+  const covered = expected.slice(offset, after)
+  if (edited && typeof value.text === 'string' && !value.text.trim()) {
+    if (value.speaker !== '' || value.heading !== '' || value.turns?.length || !covered.every(canOmit))
+      throw new TranscriptFormatError('字幕段 ' + firstSource.id + ' 含有可能表达观点的内容，请保留其发言。', true)
+    return {id: firstSource.id, through, speaker: '', heading: '', text: ''}
+  }
+  const source = covered.length === 1 ? firstSource : {...firstSource, text: covered.map(unit => unit.text).join('\n')}
   const first = speech(value, source.id, false)
   const turns = value.turns?.map(turn => speech(turn, source.id, true))
+  if (edited && covered.length > 1) {
+    let speakers = 1, previous = first.speaker
+    for (const turn of turns ?? []) {
+      // Repeating a named speaker is still the same attribution. A neutral
+      // label can appear on two separately rendered, unidentified turns.
+      if (turn.speaker.toLowerCase() !== previous.toLowerCase() || turn.speaker === '未署名发言人') speakers++
+      previous = turn.speaker
+    }
+    if (speakers < minimumTurns(covered))
+      throw new TranscriptFormatError('字幕段 ' + source.id + ' 至 ' + through + ' 的不同发言被合并，请按换人标记分开有实质内容的发言，没有姓名依据时用未署名发言人。', true)
+  }
   // IDs verify source order; a coarse length check also catches an empty or
   // manifestly abbreviated answer. Neither check establishes semantic fidelity.
   const sourceLength = source.text.replace(/\s/gu, '').length
@@ -134,10 +203,10 @@ function validateUnit(value: TranslatedUnit | null, source: TranscriptUnit, next
     throw new TranscriptFormatError('字幕段 ' + source.id + ' 的叙述必须译成中文，不能整段照抄英文。' +
       (names ? '仅这些专名按原文拼写保留：' + names + '。' : ''), true)
   }
-  validateNames(source.id, translated, source.text, next)
-  if (sourceLength >= 100 && translatedLength < sourceLength * 0.08)
+  validateNames(source.id, translated, source.text, expected[after])
+  if (!edited && sourceLength >= 100 && translatedLength < sourceLength * 0.08)
     throw new TranscriptFormatError('字幕段 ' + source.id + ' 的译文明显过短。')
-  return {id: source.id, heading: singleLine(value.heading).replace(/^#+\s*/u, ''), ...first, turns}
+  return {id: source.id, through, heading: singleLine(value.heading).replace(/^#+\s*/u, ''), ...first, turns}
 }
 
 // Gemini orders titles before subtitle records. Only complete JSON objects may
@@ -148,6 +217,7 @@ export class TranscriptResponse {
   private raw = ''
   private offset = 0
   private seen = 0
+  private records = 0
   private recordStart = -1
   private depth = 0
   private quoted = false
@@ -156,7 +226,8 @@ export class TranscriptResponse {
   private last?: TranslatedUnit
   articleTitle = ''
   chapterTitle = ''
-  constructor(private expected: TranscriptUnit[], private defaultChinese: boolean) {}
+  constructor(private expected: TranscriptUnit[], private defaultChinese: boolean, readonly edited = false,
+    private titlesToPublish = {article: true, chapter: true}) {}
 
   *append(chunk: string): Generator<TranslatedUnit> {
     this.raw += chunk
@@ -187,11 +258,21 @@ export class TranscriptResponse {
       if (char === '"') this.quoted = true
       else if (char === '{') this.depth++
       else if (char === '}' && --this.depth === 0) {
-        let value: TranslatedUnit
+        let value: WireUnit
         try { value = JSON.parse(this.raw.slice(this.recordStart, this.offset)) }
         catch { throw new TranscriptFormatError('转写条目格式有误。') }
-        const source = this.expected[this.seen++]
-        const unit = validateUnit(value, source, this.expected[this.seen], this.defaultChinese)
+        const unit = validateUnit(value, this.expected, this.seen, this.defaultChinese, this.edited)
+        // Only the first substantive record can publish this batch's headers.
+        // Later envelopes still have to be well formed, even when neither title
+        // is used (or when the entire group is disposable).
+        if (unit.text && this.edited && this.defaultChinese && (this.titlesToPublish.article || this.titlesToPublish.chapter)) {
+          if ((this.titlesToPublish.article && untranslatedTitle(this.articleTitle)) ||
+              (this.titlesToPublish.chapter && untranslatedTitle(this.chapterTitle)))
+            throw new TranscriptFormatError('请把本次要显示的标题译成中文，专名或型号可以保留原文。')
+          this.titlesToPublish = {article: false, chapter: false}
+        }
+        this.seen += unit.through - unit.id + 1
+        this.records++
         this.recordStart = -1
         this.needComma = true
         if (this.seen === this.expected.length) this.last = unit
@@ -204,7 +285,7 @@ export class TranscriptResponse {
     let result: {units?: unknown[]}
     try { result = JSON.parse(this.raw) }
     catch { throw new TranscriptFormatError('转写响应提前结束。') }
-    if (!this.last || !Array.isArray(result?.units) || result.units.length !== this.expected.length)
+    if (!this.last || !Array.isArray(result?.units) || result.units.length !== this.records)
       throw new TranscriptFormatError('转写未按顺序返回全部字幕段。')
     return this.last
   }
@@ -216,26 +297,25 @@ export interface TranscriptLayout {
   heading: string
   lastText: string
   rejectedSpeaker?: string
+  answerSpeaker?: string
 }
 
 export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUnit, response: TranscriptResponse,
-  layout: TranscriptLayout, at?: string) {
+  layout: TranscriptLayout, at?: string, firstArticle = source.id === 1) {
+  if (!unit.text) return ''
   const first = !layout.chapterTitle
   const title = response.chapterTitle.replace(/^\[\d+(?::\d+){1,2}\]\s*(?=\S)/u, '')
   let markdown = ''
-  if (source.id === 1) markdown += '# ' + response.articleTitle
+  if (firstArticle) markdown += '# ' + response.articleTitle
   if (first) {
     layout.chapterTitle = title
     markdown += '\n\n## ' + (at ? '[' + at + '] ' : '') + title
   }
-  const heading = unit.heading.trim()
-  const newSubject = Boolean(heading && heading !== title && heading !== layout.heading)
-  if (newSubject) {
-    layout.heading = heading
-    markdown += '\n\n### ' + heading
-  }
-  const markedTurn = source.text.startsWith('>>')
-  const sourceLabel = /^(?:>>\s*)?(?:\*\*)?([\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*(?:[ \t]+[\p{Lu}\p{Lt}][\p{L}\p{M}’'.-]*){0,3}|[\p{Script=Han}·]{1,10})(?:\*\*)?\s*[：:]/u.exec(source.text)?.[1]
+  // When an edited range starts with an empty courtesy, the first substantive
+  // speaker can belong to a later cue. Don't give their words to the greeter.
+  const silentLead = response.edited && unit.through > unit.id && canOmit(source)
+  const markedTurn = !silentLead && source.text.startsWith('>>')
+  const sourceLabel = !silentLead && speakerLabel.exec(source.text)?.[1]
   let firstSpeaker = sourceLabel || unit.speaker
   if (markedTurn && !sourceLabel && (!firstSpeaker || firstSpeaker.toLowerCase() === layout.speaker.toLowerCase())) {
     layout.rejectedSpeaker = layout.speaker
@@ -246,10 +326,25 @@ export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUni
   } else if (firstSpeaker || markedTurn) {
     layout.rejectedSpeaker = undefined
   }
+  const initialSpeaker = firstSpeaker || layout.speaker
+  const questionEnd = /[?？][”’"'）)]*$/u
+  const beginsAnswer = (name: string) => Boolean(name && name !== '未署名发言人' && layout.speaker &&
+    name !== layout.speaker && questionEnd.test(layout.lastText))
+  // In a Q&A, several facets of the same person's answer can arrive in
+  // different records or requests. Keep the question's subheading over them.
+  const continuingAnswer = !markedTurn && initialSpeaker === layout.answerSpeaker
+  const sameAnswer = response.edited && !first && !questionEnd.test(unit.text) && !questionEnd.test(source.text)
+    && (beginsAnswer(initialSpeaker) || continuingAnswer)
+  const heading = unit.heading.trim()
+  const newSubject = Boolean(heading && heading !== title && heading !== layout.heading && !sameAnswer)
+  if (newSubject) {
+    layout.heading = heading
+    markdown += '\n\n### ' + heading
+  }
   let startParagraph = first || newSubject || markedTurn
   for (const turn of [unit, ...(unit.turns ?? [])]) {
     const speaker = (turn === unit ? firstSpeaker : turn.speaker) || layout.speaker
-    const labelSpeaker = Boolean(speaker && (startParagraph || speaker !== layout.speaker))
+    const labelSpeaker = Boolean(speaker && (startParagraph || speaker !== layout.speaker || (response.edited && turn !== unit)))
     // An unfinished sentence may continue across subtitle units or batches.
     if (startParagraph || labelSpeaker || /[。！？.!?…][”’"')）]*$/u.test(layout.lastText))
       markdown += '\n\n'
@@ -257,6 +352,11 @@ export function formatTranscriptUnit(unit: TranslatedUnit, source: TranscriptUni
       markdown += ' '
     if (labelSpeaker) markdown += '**' + speaker + '：** '
     markdown += turn.text
+    if (response.edited) {
+      if (questionEnd.test(turn.text)) layout.answerSpeaker = undefined
+      else if (beginsAnswer(speaker)) layout.answerSpeaker = speaker
+      else if (speaker !== layout.speaker || (markedTurn && turn === unit)) layout.answerSpeaker = undefined
+    }
     layout.speaker = speaker
     layout.lastText = turn.text
     startParagraph = false

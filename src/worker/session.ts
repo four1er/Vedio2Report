@@ -3,7 +3,7 @@ import { preparedSource } from './caption-cache'
 import { summarize, TransientError, writeArticle } from './gemini'
 import { ApiError, chapterHeadings, extractChapters, failure, json, requireChapterRecap } from './protocol'
 import type { Bindings, Summary, TranscriptCoverage } from './protocol'
-import { requestsEditorialAdaptation } from './transcript-intent'
+import { articleMode } from './transcript-intent'
 
 const lifetime = 24 * 60 * 60 * 1000
 const encoder = new TextEncoder()
@@ -119,8 +119,10 @@ export class ArticleSession {
   }
 
   private async *generate(video: Video, requirements: string, signal: AbortSignal): AsyncGenerator<StreamEvent> {
+    const mode = articleMode(requirements)
+    const tracksCoverage = mode !== 'adapted'
     yield ['meta', {
-      articleId: this.state.id.toString(), videoId: video.videoId, source: video.source, title: video.title,
+      mode, articleId: this.state.id.toString(), videoId: video.videoId, source: video.source, title: video.title,
       sourceUrl: video.sourceUrl, sourceLabel: video.sourceLabel,
       durationSeconds: video.durationSeconds, lastCaptionSeconds: video.lastCaptionSeconds, cueCount: video.cueCount,
       timeline: video.timeline?.map(({at, topic}) => ({at, topic})),
@@ -135,15 +137,14 @@ export class ArticleSession {
     let nextLine = 0
     let headingsSeen = 0
     let published = 0
-    const fullTranscript = !requestsEditorialAdaptation(requirements)
     let coverage: TranscriptCoverage | undefined
     let publishedUnits = 0
     let publishedLength = 0
     const checkpoint = async (prefix: string) => {
       const chapter = extractChapters(prefix).at(-1)!
-      if (fullTranscript) {
+      if (tracksCoverage) {
         if (!coverage || coverage.completed <= publishedUnits || chapter.id !== 'ch-' + (published + 1))
-          throw new ApiError(502, '本章转写尚未完整。')
+          throw new ApiError(502, '本章内容尚未完整。')
         publishedUnits = coverage.completed
       } else requireChapterRecap(chapter)
       await this.publish(prefix, published + 1, expiresAt, coverage)
@@ -155,9 +156,9 @@ export class ArticleSession {
       if (typeof text !== 'string') {
         if ('coverage' in text) {
           const {completed, total} = text.coverage
-          if (!fullTranscript || !Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(completed) ||
+          if (!tracksCoverage || !Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(completed) ||
               completed > total || (coverage ? total !== coverage.total || completed !== coverage.completed + 1 : completed !== 0))
-            throw new ApiError(502, '字幕转写进度异常，请重新生成。')
+            throw new ApiError(502, '字幕处理进度异常，请重新生成。')
           coverage = {completed, total}
           yield ['coverage', coverage]
         } else {
@@ -167,10 +168,10 @@ export class ArticleSession {
         }
         continue
       }
-      if (fullTranscript && !coverage) throw new ApiError(502, '缺少待转写字幕的范围。')
+      if (tracksCoverage && !coverage) throw new ApiError(502, '缺少待处理字幕的范围。')
       article += text
       yield ['delta', {text}]
-      if (fullTranscript) continue
+      if (tracksCoverage) continue
       // A heading can be split across deltas. Only examine lines whose newline
       // has arrived, retaining the unfinished line's starting offset.
       const newline = text.lastIndexOf('\n')
@@ -183,8 +184,15 @@ export class ArticleSession {
       }
       nextLine = end
     }
-    if (fullTranscript && (!coverage || publishedUnits !== coverage.total || publishedLength !== article.length))
-      throw new ApiError(502, '部分字幕尚未完成转写，请重新生成。')
+    if (tracksCoverage) {
+      if (!coverage || coverage.completed !== coverage.total || publishedLength !== article.length ||
+          (mode === 'verbatim' && publishedUnits !== coverage.total))
+        throw new ApiError(502, '部分字幕尚未处理完成，请重新生成。')
+      if (!published) throw new ApiError(422, '字幕中没有可整理成章的实质发言。')
+      // A closing chapter can contain only credits or repeated pleasantries.
+      // Record their review without reopening a chapter or scheduling a summary.
+      if (publishedUnits < coverage.total) await this.state.storage.put('coverage', coverage)
+    }
     const chapters = extractChapters(article)
     const remaining = chapters.slice(published)
     for (const chapter of remaining) requireChapterRecap(chapter)

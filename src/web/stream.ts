@@ -28,9 +28,12 @@ export async function responseError(response: Response, fallback: string) {
   return new Error(typeof json?.error === 'string' ? json.error : fallback + '（HTTP ' + response.status + '）');
 }
 
-export function waitForRetry(retryAfter: string | null, signal: AbortSignal, defaultDelay = 2000) {
+export function retryDelayMs(retryAfter: string | null, defaultDelay = 2000) {
   const retryMs = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter || '') - Date.now();
-  const delay = Number.isFinite(retryMs) ? Math.min(2147483647, Math.max(1000, retryMs)) : defaultDelay;
+  return Number.isFinite(retryMs) ? Math.min(2147483647, Math.max(1000, retryMs)) : defaultDelay;
+}
+
+export function waitForRetry(delay: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     signal.throwIfAborted();
     const timer = setTimeout(() => {

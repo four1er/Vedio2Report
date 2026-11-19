@@ -1,0 +1,154 @@
+import {describe, expect, it} from 'vitest'
+import {formatTranscriptUnit, TranscriptFormatError, TranscriptResponse} from '../src/worker/transcript-response'
+import type {TranscriptUnit} from '../src/worker/transcript-plan'
+
+const source = (id: number, text: string): TranscriptUnit => ({id, firstCue: id, lastCue: id, text})
+const unit = (id: number, through: number, text = '已有正文。') => ({id, through, text, speaker: '', heading: ''})
+const envelope = (units: unknown[]) => JSON.stringify({articleTitle: '记录', chapterTitle: '观察过程', units})
+const layout = () => ({chapterTitle: '', speaker: '', heading: '', lastText: ''})
+
+describe('editing contiguous caption ranges', () => {
+  it('releases a grouped paragraph before STOP and holds the last range until its envelope is validated', () => {
+    const decoder = new TranscriptResponse([source(6, 'First sentence.'), source(7, 'Its example.'), source(8, 'Thanks.')], true, true)
+    const first = unit(6, 7, '这是一句话，带有“{例证}”。')
+    const raw = envelope([first, unit(8, 8, '')])
+    const split = raw.indexOf('"id":8')
+    const early = [...decoder.append(raw.slice(0, split))]
+    expect(early).toEqual([first])
+    const rendered = formatTranscriptUnit(early[0], source(6, 'First sentence.'), decoder, layout(), undefined, true)
+    expect(rendered).toContain('# 记录\n\n## 观察过程\n\n这是一句话')
+    expect([...decoder.append(raw.slice(split))]).toEqual([])
+    const silent = decoder.finish()
+    const untouched = layout()
+    expect(formatTranscriptUnit(silent, source(8, 'Thanks.'), decoder, untouched)).toBe('')
+    expect(untouched).toEqual(layout())
+  })
+
+  it.each([
+    [unit(1, 2), unit(2, 3)], [unit(1, 1), unit(3, 3)], [unit(1, 4)],
+    [unit(1, 2)], [unit(1, 1), unit(2, 2), unit(3, 3), unit(4, 4)],
+  ])('rejects missing, overlapping, extra and out-of-batch ranges', (...rows) => {
+    const decoder = new TranscriptResponse([source(1, 'One.'), source(2, 'Two.'), source(3, 'Three.')], true, true)
+    expect(() => { [...decoder.append(envelope(rows))]; decoder.finish() }).toThrow(TranscriptFormatError)
+  })
+
+  it.each(['No.', 'Only under five percent.', 'Yes, but only when the pressure drops.', 'Thanks for confirming 18.'])(
+    'retains potentially substantive source even when a model calls it filler: %s', text => {
+      const decoder = new TranscriptResponse([source(1, text)], true, true)
+      expect(() => [...decoder.append(envelope([unit(1, 1, '')]))]).toThrow(TranscriptFormatError)
+    })
+
+  it('keeps a factual exchange separate after joining a greeting to the first substantive speech', () => {
+    const input = [source(1, 'Host: Thanks for joining us.'), source(2, 'Lin: Does the limit apply?'), source(3, 'Sam: Only at night.')]
+    const decoder = new TranscriptResponse(input, true, true)
+    const row = {...unit(1, 3, '这个限制一直适用吗？'), speaker: 'Lin'}
+    expect(() => [...decoder.append(envelope([row]))]).toThrow(TranscriptFormatError)
+    const good = new TranscriptResponse(input, true, true)
+    const output = {...row, turns: [{speaker: 'Sam', text: '只在夜间适用。'}]}
+    expect([...good.append(envelope([output]))]).toEqual([])
+    const markdown = formatTranscriptUnit(good.finish(), input[0], good, layout())
+    expect(markdown).toContain('**Lin：** 这个限制一直适用吗？\n\n**Sam：** 只在夜间适用。')
+    expect(markdown).not.toContain('Host')
+  })
+})
+
+describe('editorial titles and conversational continuity', () => {
+  it.each([
+    ['How did the industrial revolution change the cost of food?', '定价变化', true],
+    ['采访', 'Where the price of technology is heading', true],
+    ['NVIDIA', 'GPT-4', false], ['芯片上的 AI', '定价变化', false],
+  ])('checks prose titles in the default output language', (articleTitle, chapterTitle, reject) => {
+    function render(defaultChinese: boolean) {
+      const decoder = new TranscriptResponse([source(1, 'Opening.')], defaultChinese, true)
+      const response = JSON.stringify({articleTitle, chapterTitle, units: [unit(1, 1)]})
+      return [...decoder.append(response), decoder.finish()]
+    }
+    if (reject) expect(() => render(true)).toThrow(/标题.*中文/u)
+    else expect(render(true)).toHaveLength(1)
+    expect(render(false)).toHaveLength(1)
+  })
+
+  it('checks the language of titles this envelope will publish, and still requires both header fields', () => {
+    const english = 'How we measured the price of providing power'
+    const raw = (articleTitle: string, chapterTitle: string, text = '后续正文。') =>
+      JSON.stringify({articleTitle, chapterTitle, units: [unit(4, 4, text)]})
+    const continuation = new TranscriptResponse([source(4, 'A further result.')], true, true, {article: false, chapter: false})
+    expect([...continuation.append(raw(english, english)), continuation.finish()]).toHaveLength(1)
+    const nextChapter = new TranscriptResponse([source(4, 'Next topic.')], true, true, {article: false, chapter: true})
+    expect(() => [...nextChapter.append(raw(english, english))]).toThrow(/标题.*中文/u)
+    const noVisibleTitles = new TranscriptResponse([source(4, '[Music]')], true, true)
+    expect([...noVisibleTitles.append(raw(english, english, '')), noVisibleTitles.finish()][0].text).toBe('')
+    const missingTitle = new TranscriptResponse([source(4, 'Further detail.')], true, true, {article: false, chapter: false})
+    expect(() => [...missingTitle.append(raw(english, ''))]).toThrow(/缺少/u)
+  })
+
+  function renderDialogue(rows: {source: string; speaker: string; text: string; heading: string}[]) {
+    const inputs = rows.map((row, i) => source(i + 1, row.source))
+    const state = layout()
+    const records = rows.map((row, i) => ({...unit(i + 1, i + 1), heading: row.heading, text: row.text, speaker: row.speaker}))
+    const decoder = new TranscriptResponse(inputs, true, true)
+    return [...decoder.append(envelope(records)), decoder.finish()].map((item, i) =>
+      formatTranscriptUnit(item, inputs[i], decoder, state)).join('')
+  }
+
+  it('may omit a standalone courtesy reaction between two distinct substantive turns', () => {
+    const decoder = new TranscriptResponse([source(1, '>> Oh, fantastic!')], true, true)
+    expect([...decoder.append(envelope([unit(1, 1, '')]))]).toEqual([])
+    expect(decoder.finish().text).toBe('')
+  })
+
+  it('keeps the question and a multi-paragraph answer under one subheading until the next question', () => {
+    const article = renderDialogue([
+      {source: 'Amy: How do you test it?', speaker: 'Amy', text: '你们怎么测试？', heading: '如何验证'},
+      {source: 'Sam: We compare with the reference.', speaker: 'Sam', text: '我们先和参考结果对照。', heading: '参考结果'},
+      {source: 'Then we vary the temperature.', speaker: 'Sam', text: '接着改变温度。', heading: '温度的作用'},
+      {source: 'Amy: What about the price?', speaker: 'Amy', text: '成本如何？', heading: '成本'},
+    ])
+    expect(article.match(/^### .+/gm)).toEqual(['### 如何验证', '### 成本'])
+    expect(article.match(/\*\*Sam：\*\*/g)).toHaveLength(1)
+    expect(article).toContain('对照。\n\n接着改变温度。')
+  })
+
+  it('allows new subtopics in independent explanations and answer-only highlights', () => {
+    for (const speaker of ['', 'Sam']) {
+      const article = renderDialogue([
+        {source: 'First let us define the problem.', speaker, text: '先来定义问题。', heading: '问题'},
+        {source: 'On the other topic, here are the results.', speaker, text: '谈到另一个问题，这是我们的结果。', heading: '结果'},
+      ])
+      expect(article.match(/^### .+/gm)).toEqual(['### 问题', '### 结果'])
+    }
+  })
+})
+
+describe('speaker boundaries inside edited source ranges', () => {
+  const group = (texts: string[], row: ReturnType<typeof unit> & {turns?: {speaker: string; text: string}[]}) => {
+    const inputs = texts.map((text, i) => source(i + 1, text))
+    const decoder = new TranscriptResponse(inputs, true, true)
+    const records = [...decoder.append(envelope([row])), decoder.finish()]
+    const state = layout()
+    return records.map(record => formatTranscriptUnit(record, inputs[record.id - 1], decoder, state)).join('')
+  }
+
+  it('rejects merging three unsigned substantive speaker changes into a single named statement', () => {
+    const inputs = ['>> I use the north entrance.', '>> I prefer the east entrance.', '>> I take the stairs.']
+    const merged = {...unit(1, 3, '我走北门、东门，还会走楼梯。'), speaker: 'Ada'}
+    expect(() => group(inputs, merged)).toThrow(TranscriptFormatError)
+  })
+
+  it('omits a simple courtesy but keeps the two substantive unsigned statements on different turns', () => {
+    const inputs = ['>> The trial met its target.', '>> Thanks!', '>> The cost doubled.']
+    const collapsed = {...unit(1, 3, '试验达到了目标，但成本翻了一倍。'), speaker: '发言人'}
+    expect(() => group(inputs, collapsed)).toThrow(TranscriptFormatError)
+    const split = {...unit(1, 3, '试验达到了目标。'), speaker: '未署名发言人',
+      turns: [{speaker: '未署名发言人', text: '成本翻了一倍。'}]}
+    expect(group(inputs, split)).toContain('**未署名发言人：** 试验达到了目标。\n\n**未署名发言人：** 成本翻了一倍。')
+  })
+
+  it('can combine ordinary lines from one identified speaker or a single unlabeled narrator', () => {
+    const single = unit(1, 3, '我提出了方法，做了测试，再把结果提交给团队。')
+    const statements = ['I proposed the method.', 'I tested it.', 'I shared the result with the team.']
+    expect(group(statements.map(text => '>> Ada: ' + text), single)).toContain('**Ada：** ' + single.text)
+    expect(group(statements, single)).toContain(single.text)
+    expect(group(statements, single)).not.toContain('发言人')
+  })
+})

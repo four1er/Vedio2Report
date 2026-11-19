@@ -1,7 +1,7 @@
 import './style.css';
 import { applyIcons } from './icons';
 import { createArticleRenderer, timestampSeconds, type Chapter } from './reader';
-import { events, responseError, waitForRetry } from './stream';
+import { events, responseError, retryDelayMs, waitForRetry } from './stream';
 import { loadSummary } from './summary';
 import { sampleMarkdown, sampleChapters, sampleSummaries, sampleSource } from './sample';
 
@@ -28,6 +28,8 @@ const timeline = element<HTMLDetailsElement>('reader-timeline');
 const topics = element<HTMLOListElement>('timeline-topics');
 const navSample = element<HTMLAnchorElement>('nav-sample');
 const navStudio = element<HTMLAnchorElement>('nav-studio');
+const modeLabels = {edited: '专题整理稿', verbatim: '逐字转写稿', adapted: '按要求改写'};
+type ArticleMode = keyof typeof modeLabels;
 let pending: AbortController | null = null;
 let readerLifetime = new AbortController();
 let markdown = '';
@@ -53,7 +55,7 @@ function openResult(sample: boolean) {
   body.replaceChildren();
   copy.hidden = true;
   element('copy-label').textContent = '复制正文';
-  element('reader-mode').textContent = sample ? '排版样稿 · 参考稿节选' : requirements.value.trim() ? '按要求生成' : '全文转写';
+  element('reader-mode').textContent = sample ? '排版样稿 · 参考稿节选' : '视频字幕成稿';
   title.textContent = sample ? '排版样稿' : '正在准备字幕…';
   source.textContent = '';
   topics.replaceChildren();
@@ -83,7 +85,7 @@ navStudio.addEventListener('click', () => { switchNav(false); input.focus({ prev
 element('fill').addEventListener('click', () => {
   input.value = 'https://www.youtube.com/watch?v=' + sampleSource.videoId;
   input.setCustomValidity('');
-  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可转写。';
+  element('url-hint').textContent = '已填入' + sampleSource.title + '。点击「开始生成」即可整理。';
   tell('');
   input.focus();
 });
@@ -142,7 +144,7 @@ async function prepareCaptions(url: string, signal: AbortSignal) {
     element('submit-caption').textContent = '准备字幕中…';
     if (data.status === 'checking') status.textContent = '正在等待字幕服务确认该视频是否有可读字幕…';
     else status.textContent = data.status === 'pending' ? '已确认有字幕，正在等待下载…' : '已确认有字幕，正在下载完整字幕文件…';
-    await waitForRetry(response.headers.get('Retry-After'), signal);
+    await waitForRetry(retryDelayMs(response.headers.get('Retry-After')), signal);
     response = await fetch('/api/captions/' + data.videoId, {signal, cache: 'no-store'});
     if (response.status === 404 && !rechecked) {
       rechecked = true;
@@ -219,11 +221,11 @@ function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?
   timeline.hidden = !topics.childElementCount;
 }
 
-function displayCoverage(data: {completed: number; total: number}) {
+function displayCoverage(data: {completed: number; total: number}, mode?: ArticleMode) {
   if (!Number.isSafeInteger(data.completed) || !Number.isSafeInteger(data.total) ||
       data.total <= 0 || data.completed < 0 || data.completed > data.total) return;
-  element('reader-mode').textContent = '全文转写';
-  coverage.textContent = '已转写字幕片段 ' + data.completed + ' / ' + data.total;
+  const label = mode === 'verbatim' ? '已转写字幕片段' : '已处理字幕片段';
+  coverage.textContent = label + ' ' + data.completed + ' / ' + data.total;
   coverage.hidden = false;
 }
 
@@ -238,6 +240,7 @@ form.addEventListener('submit', async event => {
   openResult(false);
   status.textContent = '正在检查可用字幕，确认后下载并生成正文…';
   let id = '';
+  let mode: ArticleMode | undefined;
   let captionsReady = false;
   const readyChapters: Chapter[] = [];
   let complete = false;
@@ -269,6 +272,11 @@ form.addEventListener('submit', async event => {
       const { type, data } = event;
       if (type === 'meta') {
         id = data.articleId;
+        const eventMode: unknown = data.mode;
+        if (eventMode === 'edited' || eventMode === 'verbatim' || eventMode === 'adapted') {
+          mode = eventMode;
+          element('reader-mode').textContent = modeLabels[mode];
+        }
         displaySource(data, links, captions.downloaded);
         status.textContent = '字幕已就绪，正在等待 Gemini 输出正文…';
       } else if (type === 'delta' && typeof data.text === 'string') {
@@ -276,7 +284,7 @@ form.addEventListener('submit', async event => {
         markdown += data.text;
         schedulePaint();
       } else if (type === 'coverage') {
-        displayCoverage(data);
+        displayCoverage(data, mode);
       } else if (type === 'chapter' && data.id === 'ch-' + (readyChapters.length + 1) && typeof data.title === 'string') {
         readyChapters.push({id: data.id, title: data.title});
         status.textContent = '已完成 ' + readyChapters.length + ' 章，可展开 5W1H';
@@ -285,7 +293,7 @@ form.addEventListener('submit', async event => {
         throw new Error(typeof data.message === 'string' ? data.message : '生成中断，请重试。');
       } else if (type === 'done') {
         if (!Array.isArray(data.chapters)) throw new Error('章节信息缺失，请重新生成。');
-        if (data.coverage) displayCoverage(data.coverage);
+        if (data.coverage) displayCoverage(data.coverage, mode);
         readyChapters.splice(0, readyChapters.length, ...data.chapters);
         complete = true;
       }

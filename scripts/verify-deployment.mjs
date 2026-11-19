@@ -4,7 +4,7 @@ import { setTimeout as pause } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright-core';
 import { events } from '../src/web/stream.ts';
-import { archiveUnitCount, verifyCoverage, verifyInterview } from './transcript-evidence.mjs';
+import { archiveUnitCount, verifyCoverage, verifyInterview, verifyLecture, verifyUnitOutput } from './transcript-evidence.mjs';
 
 const workerUrl = /^https:\/\/vedio2report\.[a-z0-9-]+\.workers\.dev$/;
 async function resolveOrigin(input) {
@@ -22,14 +22,17 @@ async function resolveOrigin(input) {
 }
 const {values, positionals} = parseArgs({allowPositionals: true, options: {
   url: {type: 'string'}, 'expect-source': {type: 'string'}, full: {type: 'boolean'}, default: {type: 'boolean'},
-  adapted: {type: 'boolean'}, 'markdown-out': {type: 'string'}, 'events-out': {type: 'string'}, 'expect-caption-error': {type: 'boolean'},
+  verbatim: {type: 'boolean'}, adapted: {type: 'boolean'}, 'markdown-out': {type: 'string'}, 'events-out': {type: 'string'}, 'expect-caption-error': {type: 'boolean'},
 }});
 assert.equal(positionals.length, 1, 'Pass one Worker URL or Wrangler deployment file.');
 const fullCoverage = values.full === true;
 const expectCaptionError = values['expect-caption-error'] === true;
 const constrained = values.adapted === true;
-assert.ok([values.default, fullCoverage, constrained, expectCaptionError].filter(Boolean).length <= 1,
-  'Choose one of --default (all captions), --full (also check publisher topics), --adapted or --expect-caption-error.');
+const mode = constrained ? 'adapted' : values.verbatim ? 'verbatim' : 'edited';
+const modeLabels = {edited: '专题整理稿', verbatim: '逐字转写稿', adapted: '按要求改写'};
+assert.ok([values.default, values.verbatim, constrained, expectCaptionError].filter(Boolean).length <= 1,
+  'Choose one of --default (edited article), --verbatim, --adapted or --expect-caption-error.');
+assert.ok(!fullCoverage || !(constrained || expectCaptionError), '--full checks publisher topics for complete edited or verbatim articles');
 const sources = ['youtube', 'cached', 'archived-youtube', 'published-captions', 'native-api'];
 const expectedSource = values['expect-source'];
 if (expectedSource !== undefined) assert.ok(!expectCaptionError && sources.includes(expectedSource), 'Choose a supported caption source for a successful run');
@@ -101,13 +104,19 @@ function observeReading() {
   document.querySelector('form').addEventListener('submit', () => {
     window.submittedAt = performance.now();
     window.lastArticleActivity = window.submittedAt;
-    let lastVisible = 0;
+    let lastVisible = 0, lastRendered = 0;
+    window.prosePaints = [];
     let frame = 0;
     function sample() {
       frame = 0;
       let visible = 0;
-      for (const para of body.querySelectorAll('p, li, blockquote')) {
-        if (para.closest('.summary-box, .chapter-recap')) continue;
+      const paragraphs = [...body.querySelectorAll('p, li, blockquote')].filter(p => !p.closest('.summary-box, .chapter-recap'));
+      const rendered = paragraphs.reduce((sum, p) => sum + p.textContent.trim().length, 0);
+      if (rendered > lastRendered) {
+        window.prosePaints.push({at: performance.now(), rendered});
+        lastRendered = rendered;
+      }
+      for (const para of paragraphs) {
         const rect = para.getBoundingClientRect();
         if (rect.top >= innerHeight) break;
         if (rect.bottom <= 0) continue;
@@ -167,7 +176,7 @@ async function waitForChapters(page, count) {
   assert.notEqual(await result.jsonValue(), 'stalled', 'Article SSE has had no events for four minutes');
 }
 
-function checkSourceLinks(links, timeline, expectedId) {
+function checkSourceLinks(links, timeline, expectedId, chapterCount) {
   const toSeconds = value => value.split(':').reduce((total, part) => total * 60 + Number(part), 0);
   const validOffsets = new Set(timeline.map(mark => toSeconds(mark.at)));
   const offsets = links.map(href => {
@@ -180,8 +189,11 @@ function checkSourceLinks(links, timeline, expectedId) {
     assert.ok(validOffsets.has(offset), 'Chapter time link must come from a timestamp in this source');
     return offset;
   });
-  if (fullCoverage && timeline.length > 1 && timeline.every(mark => mark.topic))
-    assert.deepEqual(offsets, timeline.map(mark => toSeconds(mark.at)), 'Expected every publisher topic in chronological order');
+  assert.ok(offsets.every((offset, i) => i === 0 || offset > offsets[i - 1]), 'Chapter time links must increase in source order');
+  if (fullCoverage && timeline.length > 1 && timeline.every(mark => mark.topic)) {
+    if (mode === 'verbatim') assert.deepEqual(offsets, timeline.map(mark => toSeconds(mark.at)), 'Expected every publisher topic in chronological order');
+    else assert.equal(offsets.length, chapterCount, 'Each retained publisher chapter should link to its source timestamp');
+  }
 }
 
 async function readReadySummary(page, path) {
@@ -195,8 +207,9 @@ async function readReadySummary(page, path) {
     if (status === 200) return data;
     assert.equal(status, 202, 'Automatic 5W1H failed: ' + JSON.stringify(data));
     assert.ok(['pending', 'running'].includes(data.status));
-    assert.ok(Date.now() < deadline, 'Timed out waiting for background 5W1H');
-    await pause((Number.isFinite(retry) && retry > 0 ? retry : 2) * 1000);
+    const delay = (Number.isFinite(retry) && retry > 0 ? retry : 2) * 1000;
+    assert.ok(Date.now() + delay < deadline, 'Background 5W1H is still queued; its next read is in ' + delay / 1000 + ' seconds');
+    await pause(delay);
   }
 }
 
@@ -242,7 +255,10 @@ async function verifyPendingPanel(page, button, secondPath) {
   }, {times: 2});
   const firstRead = page.waitForResponse(res => res.url() === secondPath, {timeout: 30000});
   await button.click();
-  assert.equal((await firstRead).status(), 202, 'Expected the initially opened second panel to be pending');
+  const pending = await firstRead;
+  assert.equal(pending.status(), 202, 'Expected the initially opened second panel to be pending');
+  assert.ok(Number(pending.headers()['retry-after'] ?? 0) < 240,
+    'Background 5W1H is queued beyond the browser check window; Retry-After ' + pending.headers()['retry-after']);
   const readyRead = page.waitForResponse(res => res.url() === secondPath && res.status() === 200, {timeout: 240000});
   const secondBox = page.locator('#summary-ch-2');
   assert.ok(await secondBox.isVisible());
@@ -277,7 +293,7 @@ async function verifyPage(browser) {
   await page.locator('#video').fill(url);
   const requirements = constrained
     ? '写给刚接触本主题的读者。只讨论字幕中最主要的话题，写成两章中文问答，每章先列一个读者的问题，再根据原文回答。'
-    : '';
+    : mode === 'verbatim' ? '逐字转写全片，保留原话、口头重复与插话。' : '';
   await page.locator('#requirements').fill(requirements);
   if (eventsOut) {
     await writeFile(eventsOut, '');
@@ -396,13 +412,14 @@ async function verifyPage(browser) {
     assert.equal(request.postData(), null);
   }
   await waitForChapters(page, 0);
-  assert.match(await page.locator('#reader-status').innerText(), /(?:生成|转写)完成/, await page.locator('#feedback').textContent());
+  assert.match(await page.locator('#reader-status').innerText(), /(?:生成|整理|转写)完成/, await page.locator('#feedback').textContent());
 
-  const {partial, durationMs} = await page.evaluate(api => {
+  const {partial, paints, durationMs} = await page.evaluate(api => {
     const end = performance.getEntriesByName(api).at(-1).responseEnd;
     return {
       partial: window.readingSamples.filter(s => s.at < end && s.at < window.firstSummaryClickAt)
         .map(s => ({ms: Math.round(s.at - window.submittedAt), chars: s.visible})),
+      paints: window.prosePaints.filter(p => p.at < end).length,
       durationMs: Math.round(end - window.submittedAt),
     };
   }, api);
@@ -417,15 +434,12 @@ async function verifyPage(browser) {
     if (type === 'delta') {
       deltas++;
       markdownChunks.push(data.text);
-      if (!constrained) unitText += data.text;
+      if (mode === 'verbatim') unitText += data.text;
     }
     if (type === 'chapter') closedChapters.push(data);
     assert.ok(!done, 'Received an article event after done');
     if (type === 'coverage') {
-      if (data.completed > 0) {
-        const prose = unitText.replace(/^#{1,6}[ \t]+[^\n]*$/gm, '').replace(/^\*\*[^\n*]{1,64}[：:]\*\*\s*/gm, '').trim();
-        assert.ok(prose, 'Source unit ' + data.completed + ' was marked complete without a paragraph delta');
-      }
+      verifyUnitOutput(mode, data.completed, unitText);
       coverage.push(data);
       unitText = '';
     }
@@ -433,6 +447,8 @@ async function verifyPage(browser) {
     if (type === 'done') done = data;
   }
   assert.ok(meta && done, 'Article stream ended before meta and done');
+  assert.equal(meta.mode, mode, 'The server selected a different article mode');
+  assert.equal(await page.locator('#reader-mode').innerText(), modeLabels[mode], 'The reader should show the selected article mode');
   const chapters = done.chapters;
   const markdown = markdownChunks.join('');
   if (markdownOut) {
@@ -446,11 +462,13 @@ async function verifyPage(browser) {
     assert.ok(await display.isVisible(), 'Expected visible final caption progress');
     assert.match(await display.innerText(), new RegExp('\\b' + total + '\\s*/\\s*' + total + '\\b'));
   }
-  // For a single-unit caption the entire spoken sentence may arrive in one
-  // frame. All longer runs must show actual prose growing before completion.
-  if (total !== 1) {
-    assert.ok(partial.length >= 2 && partial.at(-1).chars > partial[0].chars && partial.at(-1).ms > partial[0].ms,
-      'Expected visible paragraph text to grow on separate frames before the article response ended');
+  // Editing can legitimately merge a short source into a single paragraph.
+  // For other runs, verify a real visible paragraph plus later painted growth.
+  // The first paragraph can fill the viewport before the next one arrives.
+  const singleBlock = deltas === 1 && chapters.length === 1 && (total === 1 || (mode === 'edited' && !fullCoverage));
+  if (!singleBlock) {
+    assert.ok(partial.length && paints >= 2,
+      'Expected visible spoken text and multiple browser paints of growing prose before the article response ended');
   }
   assert.equal(meta.videoId, videoId);
   assert.equal(meta.articleId, articleId);
@@ -462,7 +480,7 @@ async function verifyPage(browser) {
     const credits = await page.locator('#reader-source a').evaluateAll(nodes => nodes.map(a => a.href));
     assert.ok(credits.includes(new URL(meta.sourceUrl).href), 'Expected a visible source credit linking to the verified captions');
   }
-  assert.ok(deltas >= (total === 1 ? 1 : 2), 'Expected streamed text deltas for the video');
+  assert.ok(deltas >= (singleBlock ? 1 : 2), 'Expected streamed text deltas for the video');
   assert.deepEqual(closedChapters, chapters, 'Each chapter should be announced when sealed');
   if (!meta.timeline?.length) {
     for (const {title} of chapters)
@@ -475,23 +493,25 @@ async function verifyPage(browser) {
   assert.equal(rawChapters.length, chapters.length);
   assert.equal(sections.length, chapters.length);
   const links = await page.locator('.chapter-head a.chapter-time').evaluateAll(nodes => nodes.map(a => a.href));
-  checkSourceLinks(links, meta.timeline || [], videoId);
+  checkSourceLinks(links, meta.timeline || [], videoId, chapters.length);
   for (const [i, section] of sections.entries()) {
-    if (!constrained) assert.equal(section.recaps, 0, 'A full transcript should keep editorial summaries out of the dialogue');
+    if (!constrained) assert.equal(section.recaps, 0, 'The chapter’s 5W1H should stay separate from the article');
     assert.match(section.text, /\p{Script=Han}/u, 'Expected readable Chinese prose in each chapter');
     assert.equal(section.subtopics.length, [...rawChapters[i].matchAll(/^###[ \t]+\S/gm)].length, 'Every subheading should render');
     if (constrained) assert.match(section.text, /[？?][\s\S]*\p{Script=Han}/u, 'Expected a reader question followed by an answer');
   }
-  if (!constrained && videoId === 'xRh2sVcNXQ8') verifyInterview(sections);
+  if (!constrained && videoId === 'xRh2sVcNXQ8') verifyInterview(sections, mode);
+  if (mode === 'edited') verifyLecture(videoId, sections);
   // Remaining chapters have never been opened. Read their real background results too.
   for (let n = 3; n <= chapters.length; n++) validateSix(await readReadySummary(page, chapterPath(n)));
   assert.equal(await buttons.count(), chapters.length);
   const viewportEvidence = partial.length >= 2
     ? `首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长`
-    : '字幕只有一个转写单元，未测得分帧正文增长';
+    : partial.length ? `首屏正文 ${partial[0].ms} ms 可读，响应结束前共测到 ${paints} 次正文增长绘制`
+      : '全片仅一个正文块，这次未测得分帧正文增长';
   const pendingEvidence = !hasSecond ? '这次只生成一章，未测第二章的等待交互' : replayedPending ? '第二章已缓存，模拟一次 202 和一次 503 后，面板自动读到真实结果' : '第二章首次读取返回 202，下一次读取模拟一次 503，面板随后自动填入真实后台结果';
-  const coverageEvidence = constrained ? '已验证按要求改写的两章问答' : `按序确认 ${total}/${total} 个字幕单元`;
-  const evidence = `视频 ${videoId}，来源 ${meta.source}，${viewportEvidence}。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章，${coverageEvidence}。全部章节均读到六项后台结果。首章封存在 ${firstReadyMs} ms 可见。页面从未读取 5W1H 时，独立 GET 已读到首章六项缓存，点击后显示了相同结果。${pendingEvidence}。`;
+  const coverageEvidence = constrained ? '已验证按要求改写的两章问答' : mode === 'verbatim' ? `逐段转写 ${total}/${total} 个字幕单元` : `整理时按序处理 ${total}/${total} 个字幕单元`;
+  const evidence = `视频 ${videoId}，来源 ${meta.source}，${modeLabels[mode]}，${viewportEvidence}。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章，${coverageEvidence}。全部章节均读到六项后台结果。首章封存在 ${firstReadyMs} ms 可见。页面从未读取 5W1H 时，独立 GET 已读到首章六项缓存，点击后显示了相同结果。${pendingEvidence}。`;
   console.log(evidence);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY,
     `[打开已验证的公开 Worker](${origin})\n\n${evidence}\n`);

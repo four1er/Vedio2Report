@@ -109,6 +109,23 @@ describe('full transcript source coverage', () => {
     expect(check({...base, text: ''}, 3).chapters).toHaveLength(0)
   })
 
+  it('offers the editor a longer discussion while preserving the same chapter links, source IDs and text', () => {
+    const question = '>> Why did the company change its approach?'
+    const answer = '>> Our first trial changed the cost. '
+    const text = Array.from({length: 140}, (_, i) => i % 10 === 0 ? question : answer + ' ' + String(i)).join('\n')
+    const video = {...base, text, timeline: [{firstCue: 1, at: '0:00', topic: 'Trials'}]}
+    const literal = planTranscript(video)
+    const edited = planTranscript(video, undefined, 'edited')
+    expect(edited.map(({at, topic}) => ({at, topic}))).toEqual(literal.map(({at, topic}) => ({at, topic})))
+    expect(edited[0].batches.flat()).toEqual(literal[0].batches.flat())
+    expect(edited[0].batches.length).toBeLessThan(literal[0].batches.length)
+    for (const batch of edited[0].batches) {
+      expect(batch.length).toBeLessThanOrEqual(56)
+      expect(batch.reduce((size, unit) => size + unit.text.length, 0)).toBeLessThanOrEqual(9000)
+      expect(batch.at(-1)?.text).not.toBe(question)
+    }
+  })
+
   it('caps the row count when rapid speaker exchanges create many short units', () => {
     const {batches} = check({...base, text: Array(91).fill('>> 好。').join('\n')})
     expect(batches.map(batch => batch.length)).toEqual([20, 20, 20, 20, 11])

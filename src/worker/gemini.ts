@@ -1,7 +1,9 @@
 import { ApiError, dimensions, parseSummary } from './protocol'
 import type { Bindings, Chapter, Summary, TranscriptCoverage } from './protocol'
 import type { Video } from './captions'
-import { requestedChapterCount, requestsEditorialAdaptation } from './transcript-intent'
+import { articleMode, requestedChapterCount } from './transcript-intent'
+import { editingConfig, editingInstruction, expectsChineseArticle } from './edited-response'
+import type { EditedInput } from './edited-response'
 import { planTranscript } from './transcript-plan'
 import {
   formatTranscriptUnit, TranscriptFormatError, TranscriptResponse,
@@ -31,7 +33,7 @@ interface Generation {
   error?: {code?: number; status?: string; details?: {retryDelay?: string}[]}
 }
 interface Material {video: Video; requirements?: string; article?: string; chapter?: Chapter}
-type Input = Material | TranscriptInput | {summary: Summary}
+type Input = Material | TranscriptInput | EditedInput | {summary: Summary}
 
 function materialForModel(material: Input) {
   if (!('video' in material) || !material.video.timeline?.length) return material
@@ -53,7 +55,13 @@ export class TransientError extends ApiError {
 }
 
 function providerError(status: number, delayMs?: number): ApiError {
-  if (status === 429) return new TransientError(429, 'Gemini 请求频率或配额已达上限，请稍后再试。', delayMs)
+  if (status === 429) {
+    const minutes = Math.ceil((delayMs ?? 0) / 60_000)
+    const next = minutes >= 60 ? '约 ' + Math.ceil(minutes / 60) + ' 小时后再试。'
+      : '约 ' + minutes + ' 分钟后再试。'
+    return new TransientError(429, 'Gemini 请求频率或配额已达上限，' +
+      (delayMs && delayMs >= 60_000 ? '服务商建议' + next : '请稍后再试。'), delayMs)
+  }
   if (status === 408 || status >= 500)
     return new TransientError(502, 'Gemini 服务暂时不可用，请稍后重试。', delayMs)
   return new ApiError(502, 'Gemini 请求未获接受，请检查服务端的密钥、模型和访问权限。')
@@ -256,13 +264,19 @@ async function* translatedUnits(decoder: TranscriptResponse, stream: AsyncIterab
   yield decoder.finish()
 }
 
-async function* transcribe(env: Bindings, {video, requirements}: Material, signal: AbortSignal): AsyncGenerator<ArticleUpdate> {
-  const chapters = planTranscript(video, requestedChapterCount(requirements))
+async function* writeFromCaptions(env: Bindings, {video, requirements}: Material, signal: AbortSignal,
+  mode: 'edited' | 'verbatim'): AsyncGenerator<ArticleUpdate> {
+  const edited = mode === 'edited'
+  const action = edited ? '整理' : '转写'
+  const instruction = edited ? editingInstruction : transcriptionInstruction
+  const defaultChinese = expectsChineseArticle(requirements)
+  const chapters = planTranscript(video, requestedChapterCount(requirements), mode)
   const source = chapters.flatMap(chapter => chapter.batches.flat())
   if (!source.length) throw new ApiError(422, '未找到可读字幕。')
   const total = source.length
   let completed = 0
   let lastSpeaker = ''
+  let hasArticle = false
   yield {coverage: {completed, total}}
 
   for (const [index, chapter] of chapters.entries()) {
@@ -272,25 +286,38 @@ async function* transcribe(env: Bindings, {video, requirements}: Material, signa
         // A failed request resumes at the first unpublished ID. A smaller request
         // on format/length failures leaves the rest of this batch in the queue.
         let start = 0, window = batch.length, formatRepairs = 0, transientRetries = 0
+        let failedAt = -1
         let repair: string | undefined
         let isolateUnit = false
         while (start < batch.length) {
           signal.throwIfAborted()
           const units = batch.slice(start, start + (isolateUnit ? 1 : window))
-          const input: TranscriptInput = {
+          const first = units[0].id, last = units[units.length - 1].id
+          const input: TranscriptInput | EditedInput = {
             sourceTitle: video.title, topic: chapter.topic, at: chapter.at,
             chapterTitle: layout.chapterTitle || undefined, previousSpeaker: layout.speaker || undefined,
             previousExcerpt: completed ? source[completed - 1].text : undefined,
-            previousTranslation: layout.lastText.slice(-160) || undefined, repair, units,
+            previousTranslation: layout.lastText.slice(edited ? -450 : -160) || undefined,
+            ...(edited && layout.heading && {previousHeading: layout.heading}), repair,
+            ...(edited ? {
+              units: units.map(({id, text}) => ({id, text})),
+              idRule: first === last ? '本次只有一条：id 和 through 都必须等于 ' + first + '。'
+                : '本次编号仅从 ' + first + ' 到 ' + last + '，首组 id 与末组 through 必须分别等于这两个端点。',
+            } : {units}),
           }
-          const decoder = new TranscriptResponse(units, !requirements?.trim())
+          const config = edited ? editingConfig(first, last) : transcriptionConfig
+          const decoder = new TranscriptResponse(units, defaultChinese, edited, {article: !hasArticle, chapter: !layout.chapterTitle})
           const deadline = AbortSignal.any([signal, AbortSignal.timeout(100_000)])
           try {
-            const stream = streamText(env, transcriptionInstruction, input, transcriptionConfig, deadline, requirements)
+            const stream = streamText(env, instruction, input, config, deadline, requirements)
             for await (const item of translatedUnits(decoder, stream)) {
-              yield formatTranscriptUnit(item, source[completed], decoder, layout, chapter.at)
-              start++
-              yield {coverage: {completed: ++completed, total}}
+              const markdown = formatTranscriptUnit(item, source[completed], decoder, layout, chapter.at, !hasArticle)
+              if (markdown) {
+                yield markdown
+                hasArticle = true
+              }
+              start += item.through - item.id + 1
+              while (completed < item.through) yield {coverage: {completed: ++completed, total}}
             }
             formatRepairs = 0
             transientRetries = 0
@@ -299,10 +326,16 @@ async function* transcribe(env: Bindings, {video, requirements}: Material, signa
           } catch (error) {
             signal.throwIfAborted()
             if (error instanceof TranscriptFormatError) {
-              if (++formatRepairs > 2) throw error
-              isolateUnit = error.isolateUnit
+              // Separate defects in already-published groups must not exhaust
+              // the repair budget of the current source position.
+              if (edited && failedAt !== start) formatRepairs = 0
+              failedAt = start
+              if (++formatRepairs > (edited ? 3 : 2)) throw error
+              isolateUnit = error.isolateUnit || (edited && formatRepairs >= 2)
               if (!isolateUnit) window = Math.max(1, Math.ceil(units.length / 2))
-              repair = error.message + ' 仅完整重写本次列表中的每段原话，按给定 id 返回。'
+              repair = edited
+                ? error.message.replace(/字幕段 \d+(?: 至 \d+)?/gu, '前次回复') + ' 只采用本次输入的 idRule，保留实质内容。'
+                : error.message + ' 仅完整重写本次列表中的每段原话，按给定 id 返回。'
             } else {
               const failure = deadline.aborted ? new TransientError(502, '本批字幕转写超时。') : streamFailure(error, signal)
               await pauseBeforeRetry(failure, transientRetries++, signal, transcriptRetryDelays)
@@ -311,19 +344,21 @@ async function* transcribe(env: Bindings, {video, requirements}: Material, signa
         }
       }
       lastSpeaker = layout.speaker
-      yield {chapterEnd: true}
+      if (layout.chapterTitle) yield {chapterEnd: true}
     } catch (error) {
       signal.throwIfAborted()
       const detail = error instanceof ApiError ? error.message : '字幕转写中断。'
       throw new ApiError(error instanceof ApiError ? error.status : 502,
-        '第 ' + (index + 1) + '/' + chapters.length + ' 章，已转写 ' + completed + '/' + total + ' 段：' + detail)
+        '第 ' + (index + 1) + '/' + chapters.length + ' 章，已' + action + ' ' + completed + '/' + total + ' 段：' + detail)
     }
   }
+  if (!hasArticle) throw new ApiError(422, '字幕中没有可整理成正文的实质发言。')
 }
 
 export async function* writeArticle(env: Bindings, material: Material, signal: AbortSignal): AsyncGenerator<ArticleUpdate> {
-  if (!requestsEditorialAdaptation(material.requirements)) {
-    yield* transcribe(env, material, signal)
+  const mode = articleMode(material.requirements)
+  if (mode !== 'adapted') {
+    yield* writeFromCaptions(env, material, signal, mode)
     return
   }
   const deadline = AbortSignal.any([signal, AbortSignal.timeout(180_000)])

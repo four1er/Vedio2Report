@@ -13,8 +13,11 @@ export interface TranscriptChapter {
 }
 
 const maxUnit = 380
-const maxBatch = 3000
-const maxUnitsPerBatch = 20
+type TranscriptMode = 'verbatim' | 'edited'
+const batchLimits = {
+  verbatim: {characters: 3000, units: 20},
+  edited: {characters: 9000, units: 56},
+}
 const maxUntimedChapter = 14_000
 
 type Mark = {firstCue: number; offset?: number; at?: string; topic?: string}
@@ -159,18 +162,28 @@ function sectionUnits(lines: string[], first: Mark, end: Mark, firstId: number):
   return units
 }
 
-function batchUnits(units: TranscriptUnit[]) {
+// Editors need enough of the same discussion to combine repeated explanations.
+// When a batch is full, prefer starting the next one on a new speaker's topic.
+function batchUnits(units: TranscriptUnit[], mode: TranscriptMode) {
   const batches: TranscriptUnit[][] = []
-  let size = 0
-  for (const unit of units) {
-    let batch = batches.at(-1)
-    if (!batch || batch.length >= maxUnitsPerBatch || size + unit.text.length > maxBatch) {
-      batch = []
-      batches.push(batch)
-      size = 0
+  const limit = batchLimits[mode]
+  for (let first = 0; first < units.length;) {
+    let end = first
+    let size = 0
+    while (end < units.length && end - first < limit.units && size + units[end].text.length <= limit.characters) {
+      size += units[end++].text.length
     }
-    batch.push(unit)
-    size += unit.text.length
+    if (mode === 'edited' && end < units.length) {
+      const earliest = first + Math.ceil((end - first) * 0.75)
+      for (let i = end; i >= earliest; i--) {
+        if (speakerStart.test(units[i].text) && !/[?？]["'”’）)]*$/u.test(units[i - 1].text)) {
+          end = i
+          break
+        }
+      }
+    }
+    batches.push(units.slice(first, end))
+    first = end
   }
   return batches
 }
@@ -196,7 +209,7 @@ function balancedGroups(units: TranscriptUnit[], count: number): TranscriptUnit[
   return groups
 }
 
-export function planTranscript(video: Video, chapterCount?: number): TranscriptChapter[] {
+export function planTranscript(video: Video, chapterCount?: number, mode: TranscriptMode = 'verbatim'): TranscriptChapter[] {
   const lines = video.text.split(/\r?\n/)
   const marks = timeline(video, lines.length)
   const anchors = boundaries(video, marks)
@@ -233,6 +246,6 @@ export function planTranscript(video: Video, chapterCount?: number): TranscriptC
     const first = group[0].firstCue
     const mark = chapterLinks.get(group[0].id) ?? (first > coveredCue ? byCue.get(first) : undefined)
     coveredCue = group[group.length - 1].lastCue
-    return {at: mark?.at, topic: mark?.topic, batches: batchUnits(group)}
+    return {at: mark?.at, topic: mark?.topic, batches: batchUnits(group, mode)}
   })
 }

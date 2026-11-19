@@ -126,7 +126,7 @@ describe("Worker article workflow", () => {
       if (req.url.includes(":streamGenerateContent")) {
         expect(material.units.map((unit: {text: string}) => unit.text)).toEqual([transcript]);
         const response = {articleTitle: "海洋对话", chapterTitle: "观测站",
-          units: [{id: material.units[0].id, heading: "观测站介绍", speaker: "主持人", text: transcript}]};
+          units: [{id: material.units[0].id, through: material.units[0].id, heading: "观测站介绍", speaker: "主持人", text: transcript}]};
         return new Response(geminiFrame(JSON.stringify(response), "STOP"));
       }
       expect(material.video.segments).toEqual([{at: "00:00:00", topic: "开场", text: transcript}]);
@@ -136,7 +136,7 @@ describe("Worker article workflow", () => {
     });
     const events = readEvents(await app.post("/api/articles", {url}));
     const meta = await events.next();
-    expect(meta.data.source).toBe("archived-youtube");
+    expect(meta.data).toMatchObject({source: "archived-youtube", mode: "edited"});
     expect(meta.data).toMatchObject({durationSeconds: 4878, lastCaptionSeconds: 4866, cueCount: 2801});
     expect(meta.data.timeline).toEqual([{at: "00:00:00", topic: "开场"}]);
     expect(meta.data.text).toBeUndefined();
@@ -162,6 +162,56 @@ describe("Worker article workflow", () => {
     expect(await (await app.get(path)).json()).toEqual(summary);
     expect(await (await app.post(path)).json()).toEqual(summary);
     expect(requests).toHaveLength(3);
+  });
+
+  it("counts omitted material at both ends without queuing empty 5W1H chapters", async () => {
+    const app = fixture();
+    const markdown = "# 采样访谈\n\n## 测量方法\n\n**研究员：** 我在清晨取两份水样，再比对结果。";
+    vi.spyOn(gemini, "writeArticle").mockImplementation(async function* () {
+      yield {coverage: {completed: 0, total: 5}};
+      yield {coverage: {completed: 1, total: 5}}; // opening music
+      yield markdown; // one edited paragraph backed by three source IDs
+      for (const completed of [2, 3, 4]) yield {coverage: {completed, total: 5}};
+      yield {chapterEnd: true};
+      yield {coverage: {completed: 5, total: 5}}; // final thank-you after the sealed chapter
+    });
+    const summarize = vi.spyOn(gemini, "summarize").mockResolvedValue(summary);
+    const events = readEvents(await app.post("/api/articles", {url}));
+    const meta = await events.next();
+    expect(meta.data.mode).toBe("edited");
+    const id = meta.data.articleId;
+    const read = [];
+    do {
+      const event = await events.next();
+      expect(event.event).not.toBe("error");
+      read.push(event);
+    } while (read.at(-1)!.event !== "done");
+    expect(read.filter(e => e.event === "delta")).toHaveLength(1);
+    expect(read.filter(e => e.event === "chapter")).toHaveLength(1);
+    expect(read.at(-1)!.data).toEqual({coverage: {completed: 5, total: 5}, chapters: [{id: "ch-1", title: "测量方法"}]});
+    expect(await app.stores.get(id)!.get("coverage")).toEqual({completed: 5, total: 5});
+    await app.alarm(id); // no one has opened any 5W1H panel
+    expect(summarize.mock.calls[0][1].text).toBe(transcript);
+    expect(summarize.mock.calls[0][2]).toBe(markdown);
+    expect((await app.get("/api/articles/" + id + "/chapters/ch-1/summary")).status).toBe(200);
+    expect((await app.get("/api/articles/" + id + "/chapters/ch-2/summary")).status).toBe(404);
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells the reader when every caption was reviewed but none contained substantive speech", async () => {
+    const app = fixture();
+    vi.spyOn(gemini, "writeArticle").mockImplementation(async function* () {
+      yield {coverage: {completed: 0, total: 1}};
+      yield {coverage: {completed: 1, total: 1}};
+    });
+    const summarize = vi.spyOn(gemini, "summarize").mockResolvedValue(summary);
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const meta = await stream.next();
+    expect((await stream.next()).event).toBe("coverage");
+    expect((await stream.next()).event).toBe("coverage");
+    expect(await stream.next()).toMatchObject({event: "error", data: {message: expect.stringContaining("实质发言")}});
+    await app.alarm(meta.data.articleId);
+    expect(summarize).not.toHaveBeenCalled();
   });
 
   it.each(["incomplete", "unsealed", "skipped ID", "missing plan"])("never marks an %s transcript as finished", async failure => {
@@ -291,7 +341,7 @@ describe("Worker article workflow", () => {
         return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
       if (++articleCalls === 1) {
         const topic = {articleTitle: "海洋对话", chapterTitle: "观测站", units: [
-          {id: 1, heading: "观测站介绍", speaker: "研究员", text: "研究员介绍观测站。"},
+          {id: 1, through: 1, heading: "观测站介绍", speaker: "研究员", text: "研究员介绍观测站。"},
         ]};
         return new Response(geminiFrame(JSON.stringify(topic), "STOP"));
       }

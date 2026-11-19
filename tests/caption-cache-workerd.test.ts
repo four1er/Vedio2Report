@@ -200,7 +200,7 @@ it("streams a 512 kB caption track through SQLite and summarizes a transcript la
   });
 
   try {
-    const response = await submit(runtime, "articles", id, "分成两章");
+    const response = await submit(runtime, "articles", id, "逐字转写，分成两章");
     expect(response.status).toBe(200);
     let received = 0;
     let articleId = "";

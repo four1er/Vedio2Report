@@ -64,7 +64,15 @@ function addSummary(heading: HTMLElement, chapterId: string, title: string, load
     try {
       const summary = await load(chapterId, signal, state => {
         if (signal.aborted) return;
-        const message = state === 'pending' ? '后台正在整理本章总结，完成后会自动显示。' : '暂时无法读取本章总结，正在自动重连…';
+        let message: string;
+        if (typeof state === 'object') {
+          const localTime = new Date(state.nextCheckAt).toLocaleString('zh-CN', {
+            month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+          });
+          message = '下次查询本章 5W1H 约在本地时间 ' + localTime + '。面板展开时会自动查询。';
+        } else {
+          message = state === 'pending' ? '后台正在整理本章总结，完成后会自动显示。' : '暂时无法读取本章总结，正在自动重连…';
+        }
         if (box.textContent !== message) box.textContent = message;
       });
       if (signal.aborted) return;
@@ -113,7 +121,7 @@ function renderBlocks(raw: string, target: HTMLElement) {
   }
   for (const line of raw.split(/\r?\n/)) {
     const value = line.trim();
-    if (!value) { flush(); list = null; continue; }
+    if (!value) { flush(); continue; }
     const heading = /^(#{1,6})[ \t]+(\S.*)$/.exec(line.trimEnd());
     const item = /^([-*+]\s+|\d+[.)]\s+)(.+)$/.exec(value);
     const turn = /^\*\*([^*：:\n]{1,40}?)(?:([：:])\*\*|\*\*\s*([：:]))\s*(.*)$/.exec(value);
@@ -126,9 +134,12 @@ function renderBlocks(raw: string, target: HTMLElement) {
       fragment.append(h4);
     } else if (item) {
       flush();
-      inSpeech = false;
       const tag = /^\d/.test(item[1]) ? 'ol' : 'ul';
-      if (!list || list.localName !== tag) { list = el(tag); fragment.append(list); }
+      if (!list || list.localName !== tag) {
+        list = el(tag);
+        if (list instanceof HTMLOListElement) list.start = parseInt(item[1], 10);
+        fragment.append(list);
+      }
       const li = el('li');
       inline(li, item[2]);
       list.append(li);

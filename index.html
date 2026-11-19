@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f8f7f2" />
-    <meta name="description" content="按原片顺序将 YouTube 字幕转写成完整中文稿，逐章阅读并展开 5W1H 总结。" />
+    <meta name="description" content="把 YouTube 访谈和讲座按话题整理成中文文章，保留问答、论据和例子，逐章查看 5W1H。" />
     <title>声稿 · 视频字幕写作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23ad462d'/%3E%3Cpath d='M9 17h4v9H9zm6-7h4v20h-4zm6 4h4v15h-4zm6 4h4v7h-4z' fill='white'/%3E%3C/svg%3E" />
   </head>
@@ -27,8 +27,8 @@
       <section class="intro" aria-labelledby="intro-title">
         <div class="intro-copy">
           <p class="eyebrow"><span class="short-rule"></span>视频字幕写作台</p>
-          <h1 id="intro-title">把视频字幕<br />转写成<span>完整中文稿。</span></h1>
-          <p class="intro-description">粘贴有字幕的 YouTube 链接，按原片顺序转写发言。边生成边读，每章都可展开 5W1H 总结。</p>
+          <h1 id="intro-title">把视频字幕<br />整理成<span>中文文章。</span></h1>
+          <p class="intro-description">按话题整理全片，保留访谈里的问答、讲解中的论据和例子。边生成边读，每章都可展开 5W1H。</p>
         </div>
         <img class="hero-art" src="/editorial-art.webp" alt="" width="544" height="320" fetchpriority="high" />
       </section>
@@ -45,7 +45,7 @@
             <div class="input-wrap"><span data-icon="link"></span><input id="video" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" required autocomplete="url" aria-describedby="url-hint" maxlength="2048" /></div>
             <p class="hint" id="url-hint">支持带字幕的 YouTube 公开视频。</p>
             <div class="label-row prompt-label"><label for="requirements">写作要求<span class="optional">选填</span></label></div>
-            <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如：保留技术术语的英文原名，按发言人换段。"></textarea>
+            <textarea id="requirements" name="requirements" maxlength="2000" placeholder="例如，为初学者保留术语解释和原话中的例子。需要逐字稿可填写「逐字转写」。"></textarea>
             <div class="form-actions"><button type="submit" class="primary" id="submit"><span data-icon="pen"></span><span id="submit-caption">开始生成</span><span data-icon="arrow"></span></button></div>
             <p id="feedback" role="alert" hidden></p>
           </form>
