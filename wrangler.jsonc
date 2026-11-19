@@ -16,6 +16,10 @@
       {
         "name": "ARTICLES",
         "class_name": "ArticleSession"
+      },
+      {
+        "name": "CAPTION_CACHE",
+        "class_name": "CaptionCache"
       }
     ]
   },
@@ -25,6 +29,12 @@
       "new_sqlite_classes": [
         "ArticleSession"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "CaptionCache"
+      ]
     }
   ],
   "ratelimits": [
@@ -33,6 +43,14 @@
       "namespace_id": "1001",
       "simple": {
         "limit": 6,
+        "period": 60
+      }
+    },
+    {
+      "name": "CAPTION_LIMIT",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 12,
         "period": 60
       }
     }

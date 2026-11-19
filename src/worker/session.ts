@@ -1,10 +1,37 @@
-import { getVideoSource, type Video } from './captions'
-import { summarize, writeArticle } from './gemini'
+import type { Video } from './captions'
+import { preparedSource } from './caption-cache'
+import { summarize, TransientError, writeArticle } from './gemini'
 import { ApiError, chapterHeadings, extractChapters, failure, json, requireChapterRecap } from './protocol'
-import type { Bindings, Chapter, Summary } from './protocol'
+import type { Bindings, Summary } from './protocol'
 
 const lifetime = 24 * 60 * 60 * 1000
 const encoder = new TextEncoder()
+const summaryTimeout = 90_000
+const maxAttempts = 3
+// Chapters are committed in order. One cursor bounds execution to one inference
+// per article at a time, even across eviction, alarm redelivery and retries.
+interface SummaryQueue {
+  published: number
+  next: number
+  attempts: number
+  running: boolean
+  wakeAt: number
+}
+interface SummaryClaim {number: number; attempt: number}
+const newQueue = (): SummaryQueue => ({published: 0, next: 1, attempts: 0, running: false, wakeAt: 0})
+
+async function saveQueue(tx: DurableObjectTransaction, queue: SummaryQueue, expiresAt: number) {
+  await tx.put('queue', queue)
+  const due = queue.next <= queue.published ? Math.max(Date.now(), queue.wakeAt) : expiresAt
+  await tx.setAlarm(Math.min(due, expiresAt))
+}
+
+function advance(queue: SummaryQueue) {
+  queue.next++
+  queue.attempts = 0
+  queue.running = false
+  queue.wakeAt = 0
+}
 interface Session { expiresAt: number; requirements: string }
 type StreamEvent = [name: string, data: unknown]
 
@@ -31,7 +58,6 @@ function eventStream(events: AsyncGenerator<StreamEvent>, controller: AbortContr
 }
 
 export class ArticleSession {
-  private pending = new Map<string, Promise<Summary>>()
   constructor(private readonly state: DurableObjectState, private readonly env: Bindings) {}
 
   async fetch(request: Request): Promise<Response> {
@@ -39,13 +65,13 @@ export class ArticleSession {
       const path = new URL(request.url).pathname
       if (path === '/generate') {
         const {videoId, requirements} = await request.json() as {videoId: string; requirements: string}
-        const source = await getVideoSource(videoId)
+        const source = await preparedSource(this.env, videoId)
         const controller = new AbortController()
         const events = this.generate({...source, videoId}, requirements, controller.signal)
         return eventStream(events, controller)
       }
       const match = /^\/summary\/(ch-[1-9]\d*)$/.exec(path)
-      if (match) return json(await this.getSummary(match[1]))
+      if (match) return await this.getSummary(match[1])
       throw new ApiError(404, '未找到该接口。')
     } catch (error) { return failure(error) }
   }
@@ -57,8 +83,10 @@ export class ArticleSession {
       timeline: video.timeline?.map(({at, topic}) => ({at, topic})),
     }]
     const expiresAt = Date.now() + lifetime
-    await this.state.storage.setAlarm(expiresAt)
-    await this.state.storage.put({session: {expiresAt, requirements}, video})
+    await this.state.storage.transaction(async tx => {
+      await tx.put({session: {expiresAt, requirements}, video})
+      await saveQueue(tx, newQueue(), expiresAt)
+    })
 
     let article = ''
     let nextLine = 0
@@ -67,7 +95,7 @@ export class ArticleSession {
     const checkpoint = async (prefix: string) => {
       const chapter = extractChapters(prefix).at(-1)!
       requireChapterRecap(chapter)
-      await this.state.storage.put('article', prefix)
+      await this.publish(prefix, published + 1, expiresAt)
       published++
       return {id: chapter.id, title: chapter.title}
     }
@@ -96,39 +124,108 @@ export class ArticleSession {
     const chapters = extractChapters(article)
     const remaining = chapters.slice(published)
     for (const chapter of remaining) requireChapterRecap(chapter)
-    if (remaining.length) await this.state.storage.put('article', article)
+    if (remaining.length) await this.publish(article, chapters.length, expiresAt)
     for (const {id, title} of remaining) yield ['chapter', {id, title}]
     yield ['done', {chapters: chapters.map(({id, title}) => ({id, title}))}]
   }
 
-  private async getSummary(id: string): Promise<Summary> {
-    // Check expiry even when a scheduled alarm is delivered late.
-    const session = await this.state.storage.get<Session>('session')
+  private async publish(article: string, count: number, expiresAt: number) {
+    await this.state.storage.transaction(async tx => {
+      const queue = await tx.get<SummaryQueue>('queue')
+      if (!queue || expiresAt <= Date.now()) throw new ApiError(404, '文章已过期。')
+      await tx.put('article', article)
+      queue.published = count
+      await saveQueue(tx, queue, expiresAt)
+    })
+  }
+
+  private async getSummary(id: string): Promise<Response> {
+    const key = 'summary/' + id
+    const failed = 'failed/' + id
+    const values = await this.state.storage.get(['session', 'queue', key, failed])
+    const session = values.get('session') as Session | undefined
     if (!session || session.expiresAt <= Date.now()) throw new ApiError(404, '未找到文章或文章已过期，请重新生成。')
-    const cached = await this.state.storage.get<Summary>('summary/' + id)
-    if (cached) return cached
-    const running = this.pending.get(id)
-    if (running) return running
-    const task = this.createSummary(id, session)
-    this.pending.set(id, task)
-    try { return await task } finally { this.pending.delete(id) }
+    if (values.has(key)) return json(values.get(key))
+    if (values.has(failed)) throw new ApiError(502, String(values.get(failed)))
+    const queue = values.get('queue') as SummaryQueue | undefined
+    if (!queue) {
+      const article = await this.state.storage.get<string>('article')
+      if (article && extractChapters(article).some(chapter => chapter.id === id))
+        throw new ApiError(409, '这篇旧文章没有预生成此章总结，请重新生成文章。')
+    }
+    const number = Number(id.slice(3))
+    if (!queue || number > queue.published) throw new ApiError(404, '该章节尚未写完或不存在。')
+    return json({status: number === queue.next && queue.running ? 'running' : 'pending'}, 202, {'Retry-After': '2'})
   }
 
-  private async createSummary(id: string, session: Session): Promise<Summary> {
-    const [video, article] = await Promise.all([
-      this.state.storage.get<Video>('video'), this.state.storage.get<string>('article'),
-    ])
-    if (!video) throw new ApiError(404, '文章上下文已失效。')
-    if (!article) throw new ApiError(404, '该章节尚未写完或不存在。')
-    const chapter: Chapter | undefined = extractChapters(article).find(item => item.id === id)
-    if (!chapter) throw new ApiError(404, '该章节尚未写完或不存在。')
-    // Sessions from the former video-input path stored an ID without caption text.
-    const context = video.text ? video : {...await getVideoSource(video.videoId), videoId: video.videoId}
-    const result = await summarize(this.env, context, article, chapter, AbortSignal.timeout(90_000))
-    if (session.expiresAt <= Date.now()) throw new ApiError(404, '文章已过期，请重新生成。')
-    await this.state.storage.put('summary/' + id, result)
-    return result
+  async alarm(): Promise<void> {
+    const storage = this.state.storage
+    const session = await storage.get<Session>('session')
+    if (!session || session.expiresAt <= Date.now()) {
+      await storage.deleteAll()
+      return
+    }
+
+    const claim = await storage.transaction(async tx => {
+      const queue = await tx.get<SummaryQueue>('queue')
+      if (!queue) { await tx.setAlarm(session.expiresAt); return }
+      if (queue.next > queue.published || queue.wakeAt > Date.now()) {
+        await saveQueue(tx, queue, session.expiresAt)
+        return
+      }
+      if (queue.attempts >= maxAttempts) {
+        await tx.put('failed/ch-' + queue.next, '本章总结多次处理中断，请重新生成文章。')
+        advance(queue)
+        await saveQueue(tx, queue, session.expiresAt)
+        return
+      }
+      queue.attempts++
+      queue.running = true
+      queue.wakeAt = Date.now() + summaryTimeout + 15_000
+      // Persist the watchdog before making a request outside the Durable Object.
+      await saveQueue(tx, queue, session.expiresAt)
+      return {number: queue.next, attempt: queue.attempts}
+    })
+    if (!claim) return
+
+    const id = 'ch-' + claim.number
+    const [video, article] = await Promise.all([storage.get<Video>('video'), storage.get<string>('article')])
+    const chapter = article && extractChapters(article).find(chapter => chapter.id === id)
+    let result: Summary
+    try {
+      if (!video?.text || !article || !chapter) throw new ApiError(502, '本章总结的原文上下文不完整。')
+      const deadline = Math.max(1, Math.min(summaryTimeout, session.expiresAt - Date.now()))
+      result = await summarize(this.env, video, article, chapter, AbortSignal.timeout(deadline))
+    } catch (error) {
+      await this.finishSummary(claim, session.expiresAt, {error})
+      return
+    }
+    await this.finishSummary(claim, session.expiresAt, {result})
   }
 
-  async alarm(): Promise<void> { await this.state.storage.deleteAll() }
+  private async finishSummary(claim: SummaryClaim, expiresAt: number, outcome: {result: Summary} | {error: unknown}) {
+    await this.state.storage.transaction(async tx => {
+      const queue = await tx.get<SummaryQueue>('queue')
+      if (!queue || queue.next !== claim.number || queue.attempts !== claim.attempt || !queue.running) return
+      if (expiresAt <= Date.now()) { await tx.setAlarm(Date.now()); return }
+      const id = 'ch-' + claim.number
+      if ('result' in outcome) {
+        await tx.put('summary/' + id, outcome.result)
+      } else {
+        const {error} = outcome
+        const transient = error instanceof TransientError || (error instanceof Error && error.name === 'TimeoutError')
+        if (transient && claim.attempt < maxAttempts) {
+          const delay = error instanceof TransientError ? error.delayMs : undefined
+          queue.running = false
+          queue.wakeAt = Date.now() + Math.max(delay ?? 0, 5_000 * 2 ** (claim.attempt - 1))
+          await saveQueue(tx, queue, expiresAt)
+          return
+        }
+        const message = error instanceof ApiError ? error.message : '本章总结生成失败。'
+        await tx.put('failed/' + id, message)
+      }
+      advance(queue)
+      await saveQueue(tx, queue, expiresAt)
+    })
+  }
 }

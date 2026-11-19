@@ -1,12 +1,13 @@
+import { memoryStorage } from "./memory-storage";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker, { ArticleSession } from "../src/worker/index";
-import { getVideoSource } from "../src/worker/captions";
+import { preparedSource } from "../src/worker/caption-cache";
 import { ApiError } from "../src/worker/protocol";
 import { chapterRecapText } from "../src/shared/chapter-recap";
 
-vi.mock("../src/worker/captions", async (importOriginal) => ({
-  ...await importOriginal<typeof import("../src/worker/captions")>(),
-  getVideoSource: vi.fn(),
+vi.mock("../src/worker/caption-cache", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/worker/caption-cache")>(),
+  preparedSource: vi.fn(),
 }));
 
 const url = "https://www.youtube.com/watch?v=xRh2sVcNXQ8";
@@ -23,24 +24,12 @@ const summary = {
   how: "连续记录温度",
 };
 
-function memoryStorage() {
-  const records = new Map<string, unknown>();
-  return {
-    async get(key: string) { return structuredClone(records.get(key)); },
-    async put(key: string | Record<string, unknown>, value?: unknown) {
-      for (const [name, data] of typeof key === "string" ? [[key, value] as const] : Object.entries(key)) {
-        records.set(name, structuredClone(data));
-      }
-    },
-    async deleteAll() { records.clear(); },
-    async setAlarm() {},
-  };
-}
-
 function fixture() {
   const sessions = new Map<string, ArticleSession>();
+  const stores = new Map<string, ReturnType<typeof memoryStorage>>();
   const bindings = {
     GEMINI_API_KEY: "unit-test-only",
+    GENERATION_LIMIT: {limit: vi.fn(async () => ({success: true}))},
     ARTICLES: {
       newUniqueId: () => crypto.randomUUID().replaceAll("-", "").repeat(2),
       idFromString: (id: string) => id,
@@ -48,7 +37,9 @@ function fixture() {
         let session = sessions.get(id);
         if (!session) {
           type Args = ConstructorParameters<typeof ArticleSession>;
-          session = new ArticleSession({ id, storage: memoryStorage() } as unknown as Args[0], bindings as unknown as Args[1]);
+          const storage = stores.get(id) ?? memoryStorage();
+          stores.set(id, storage);
+          session = new ArticleSession({ id, storage } as unknown as Args[0], bindings as unknown as Args[1]);
           sessions.set(id, session);
         }
         return {
@@ -57,9 +48,15 @@ function fixture() {
       },
     },
   };
-  vi.mocked(getVideoSource).mockResolvedValue({ title: "海洋对话", text: transcript, source: "youtube" });
+  vi.mocked(preparedSource).mockResolvedValue({ title: "海洋对话", text: transcript, source: "youtube" });
   return {
     bindings,
+    stores,
+    alarm(id: string) { return sessions.get(id)!.alarm(); },
+    restart(id: string) { sessions.delete(id); bindings.ARTICLES.get(id); },
+    get(path: string) {
+      return worker.fetch(new Request(new URL(path, "https://example.test")), bindings as unknown as Parameters<typeof worker.fetch>[1]);
+    },
     post(path: string, body?: unknown) {
       const req = new Request(new URL(path, "https://example.test"), {
         method: "POST",
@@ -101,13 +98,14 @@ function readEvents(response: Response) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
 describe("Worker article workflow", () => {
   it("sends only text for the archived interview, its summary, and any translation", async () => {
     const app = fixture();
-    vi.mocked(getVideoSource).mockResolvedValueOnce({
+    vi.mocked(preparedSource).mockResolvedValueOnce({
       source: "archived-youtube", title: "访谈", text: transcript,
       durationSeconds: 4878, lastCaptionSeconds: 4866, cueCount: 2801,
       timeline: [{at: "00:00:00", firstCue: 1, topic: "开场"}],
@@ -139,7 +137,10 @@ describe("Worker article workflow", () => {
     expect(await events.next()).toEqual({event: "chapter", data: {id: "ch-1", title: "观测站"}});
     expect((await events.next()).event).toBe("done");
     const path = `/api/articles/${meta.data.articleId}/chapters/ch-1/summary`;
-    expect(await (await app.post(path)).json()).toEqual(summary);
+    expect((await app.get(path)).status).toBe(202);
+    expect(requests).toHaveLength(1);
+    await app.alarm(meta.data.articleId);
+    expect(await (await app.get(path)).json()).toEqual(summary);
     expect(await (await app.post(path)).json()).toEqual(summary);
     expect(requests).toHaveLength(3);
   });
@@ -187,7 +188,9 @@ describe("Worker article workflow", () => {
     expect((await events.next()).event).toBe("delta");
     expect(await events.next()).toEqual({event: "chapter", data: {id: "ch-1", title: "观测站"}});
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
-    const result = await app.post(path);
+    expect(await (await app.get(path)).json()).toEqual({status: "pending"});
+    await app.alarm(meta.data.articleId);
+    const result = await app.get(path);
     expect(result.status).toBe(200);
     expect(await result.json()).toEqual(summary);
     expect(calls[1].url).toContain(":generateContent");
@@ -222,13 +225,14 @@ describe("Worker article workflow", () => {
     expect(await events.next()).toEqual({event: "chapter", data: {id: "ch-1", title: "观测站"}});
     expect((await events.next()).event).toBe("error");
     const base = `/api/articles/${meta.data.articleId}/chapters/`;
-    expect((await app.post(base + "ch-1/summary")).status).toBe(200);
+    await app.alarm(meta.data.articleId);
+    expect((await app.get(base + "ch-1/summary")).status).toBe(200);
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
   });
 
   it("publishes a finished topic before the next upstream request returns any text", async () => {
     const app = fixture();
-    vi.mocked(getVideoSource).mockResolvedValueOnce({
+    vi.mocked(preparedSource).mockResolvedValueOnce({
       source: "archived-youtube", title: "海洋对话", text: "研究员介绍观测站。\n研究员说明采样。",
       timeline: [
         {at: "00:00", firstCue: 1, topic: "观测站"},
@@ -250,7 +254,7 @@ describe("Worker article workflow", () => {
       signalNextRequest();
       return nextResponse;
     });
-    const events = readEvents(await app.post("/api/articles", {url}));
+    const events = readEvents(await app.post("/api/articles", {url: "https://youtu.be/AbC123deF45"}));
     const meta = await events.next();
     let event = await events.next();
     while (event.event === "delta") event = await events.next();
@@ -258,13 +262,15 @@ describe("Worker article workflow", () => {
     const next = events.next();
     await nextRequested;
     const base = `/api/articles/${meta.data.articleId}/chapters/`;
-    expect(await (await app.post(base + "ch-1/summary")).json()).toEqual(summary);
+    await app.alarm(meta.data.articleId);
+    expect(await (await app.get(base + "ch-1/summary")).json()).toEqual(summary);
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
     finishNext(new Response(null, {status: 403}));
     event = await next;
     while (event.event === "delta") event = await events.next();
     expect(event.event).toBe("error");
-    expect((await app.post(base + "ch-1/summary")).status).toBe(200);
+    await app.alarm(meta.data.articleId);
+    expect((await app.get(base + "ch-1/summary")).status).toBe(200);
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
   });
 
@@ -285,11 +291,12 @@ describe("Worker article workflow", () => {
     expect(await events.next()).toMatchObject({event: "chapter", data: {id: "ch-1"}});
     expect(await events.next()).toMatchObject({event: "error", data: {message: expect.stringMatching(/温度记录.*章末小结.*重新生成/)}});
     const base = `/api/articles/${meta.data.articleId}/chapters/`;
-    expect((await app.post(base + "ch-1/summary")).status).toBe(200);
+    await app.alarm(meta.data.articleId);
+    expect((await app.get(base + "ch-1/summary")).status).toBe(200);
     expect((await app.post(base + "ch-2/summary")).status).toBe(404);
   });
 
-  it("can summarize a stored article from before chapter recaps were required", async () => {
+  it("reads existing legacy summaries and reports legacy chapters without a cache", async () => {
     const storage = memoryStorage();
     await storage.put({
       session: {expiresAt: Date.now() + 86_400_000, requirements: ""},
@@ -297,10 +304,15 @@ describe("Worker article workflow", () => {
       article: "# 海洋对话\n\n## 旧版章节\n\n本章只有正文。",
     });
     type Args = ConstructorParameters<typeof ArticleSession>;
-    const session = new ArticleSession({storage} as unknown as Args[0], {GEMINI_API_KEY: "test"} as Args[1]);
-    vi.stubGlobal("fetch", async () => Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]}));
-    const response = await session.fetch(new Request("https://session/summary/ch-1", {method: "POST"}));
-    expect(await response.json()).toEqual(summary);
+    const session = new ArticleSession({storage} as unknown as Args[0], {} as Args[1]);
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const read = (id: number) => session.fetch(new Request("https://session/summary/ch-" + id));
+    expect((await read(1)).status).toBe(409);
+    expect((await read(2)).status).toBe(404);
+    await storage.put("summary/ch-1", summary);
+    expect(await (await read(1)).json()).toEqual(summary);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("reports an upstream truncation without making a partial article available for summaries", async () => {
@@ -317,16 +329,157 @@ describe("Worker article workflow", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("persists a scheduled retry across eviction, polls without charging generation quota, and runs the next chapter", async () => {
+    const app = fixture();
+    let calls = 0;
+    const clock = vi.spyOn(Date, "now");
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Request(input, init).url.includes(":streamGenerateContent"))
+        return new Response(geminiFrame(firstPart + secondPart, "STOP"));
+      if (++calls === 1) return new Response(null, {status: 429, headers: {"Retry-After": "70"}});
+      return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
+    });
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const id = (await stream.next()).data.articleId;
+    while ((await stream.next()).event !== "done") { /* consume SSE */ }
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    const start = Date.now();
+    await app.alarm(id);
+    const scheduled = (await app.stores.get(id)!.getAlarm())!;
+    expect(scheduled).toBeGreaterThanOrEqual(start + 70_000);
+    app.restart(id);
+    await app.alarm(id);
+    for (let i = 0; i < 4; i++) {
+      const pending = await app.get(path);
+      expect(pending.status).toBe(202);
+      expect(pending.headers.get("Retry-After")).toBe("2");
+      expect(await pending.json()).toEqual({status: "pending"});
+    }
+    expect(calls).toBe(1);
+    clock.mockReturnValue(scheduled);
+    await Promise.all([app.alarm(id), app.alarm(id)]);
+    expect(await (await app.get(path)).json()).toEqual(summary);
+    expect(calls).toBe(2);
+    await app.alarm(id);
+    app.bindings.GEMINI_API_KEY = "";
+    expect(await (await app.get(path.replace("ch-1", "ch-2"))).json()).toEqual(summary);
+    expect(calls).toBe(3);
+    expect(app.bindings.GENERATION_LIMIT.limit).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers an interrupted running job after its lease and ignores a stale completion", async () => {
+    const app = fixture();
+    let reported!: () => void;
+    const started = new Promise<void>(resolve => { reported = resolve; });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Request(input, init).url.includes(":streamGenerateContent")) return new Response(geminiFrame(firstPart, "STOP"));
+      const what = ++calls === 1 ? "旧任务的回答" : "恢复后的回答";
+      if (calls === 1) { reported(); await hold; }
+      return Response.json({candidates: [{content: {parts: [{text: JSON.stringify({...summary, what})}]}, finishReason: "STOP"}]});
+    });
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const id = (await stream.next()).data.articleId;
+    while ((await stream.next()).event !== "done") { /* consume SSE */ }
+    const interrupted = app.alarm(id);
+    await started;
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    const wakeAt = (await app.stores.get(id)!.getAlarm())!;
+    app.restart(id);
+    await app.alarm(id);
+    expect(calls).toBe(1);
+    vi.spyOn(Date, "now").mockReturnValue(wakeAt);
+    await app.alarm(id);
+    release();
+    await interrupted;
+    await app.alarm(id);
+    expect(await (await app.get(path)).json()).toEqual({...summary, what: "恢复后的回答"});
+    expect(calls).toBe(2);
+  });
+
+  it("records a terminal failure and proceeds to the next chapter", async () => {
+    const app = fixture();
+    let calls = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Request(input, init).url.includes(":streamGenerateContent"))
+        return new Response(geminiFrame(firstPart + secondPart, "STOP"));
+      if (++calls === 1) return new Response(null, {status: 403});
+      return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
+    });
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const id = (await stream.next()).data.articleId;
+    while ((await stream.next()).event !== "done") { /* consume SSE */ }
+    await app.alarm(id);
+    await app.alarm(id);
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    expect((await app.get(path)).status).toBe(502);
+    expect((await app.get(path.replace("ch-1", "ch-2"))).status).toBe(200);
+    expect((await app.post(path)).status).toBe(502);
+    expect(calls).toBe(2);
+  });
+
+  it("expires an in-flight summary and prevents its late result from recreating a deleted session", async () => {
+    const app = fixture();
+    let finish!: () => void;
+    const response = new Promise<void>(resolve => { finish = resolve; });
+    let started!: () => void;
+    const starting = new Promise<void>(resolve => { started = resolve; });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Request(input, init).url.includes(":streamGenerateContent")) return new Response(geminiFrame(firstPart, "STOP"));
+      started();
+      await response;
+      return Response.json({candidates: [{content: {parts: [{text: JSON.stringify(summary)}]}, finishReason: "STOP"}]});
+    });
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const id = (await stream.next()).data.articleId;
+    while ((await stream.next()).event !== "done") { /* consume SSE */ }
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    const working = app.alarm(id);
+    await starting;
+    const {expiresAt} = await app.stores.get(id)!.get("session") as {expiresAt: number};
+    vi.spyOn(Date, "now").mockReturnValue(expiresAt + 1);
+    expect((await app.get(path)).status).toBe(404);
+    await app.alarm(id);
+    finish();
+    await working;
+    for (const key of ["session", "article", "video", "queue", "summary/ch-1"]) expect(await app.stores.get(id)!.get(key)).toBeUndefined();
+    expect((await app.get(path)).status).toBe(404);
+  });
+
+  it("limits new caption checks independently and lets readers poll without a Gemini key or generation quota", async () => {
+    const app = fixture();
+    const id = "AbC123deF45";
+    const fetch = vi.fn(async () => Response.json({status: "pending", videoId: id}, {status: 202}));
+    const limit = vi.fn().mockResolvedValueOnce({success: true}).mockResolvedValue({success: false});
+    const idFromName = vi.fn(value => value);
+    Object.assign(app.bindings, {
+      CAPTION_LIMIT: {limit},
+      CAPTION_CACHE: {idFromName, get: () => ({fetch})},
+      GEMINI_API_KEY: "",
+    });
+    for (const query of ["/api/captions/" + id, "/api/captions/" + id])
+      expect((await app.get(query)).status).toBe(202);
+    expect(limit).not.toHaveBeenCalled();
+    expect((await app.post("/api/captions", {url: "https://youtu.be/" + id})).status).toBe(202);
+    expect((await app.post("/api/captions", {url: "https://youtu.be/" + id})).status).toBe(429);
+    expect(limit).toHaveBeenCalledTimes(2);
+    expect(app.bindings.GENERATION_LIMIT.limit).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(idFromName.mock.calls).toEqual([[id], [id], [id]]);
+  });
+
   it("rejects a non-YouTube URL before fetching captions", async () => {
     const app = fixture();
     const res = await app.post("/api/articles", { url: "https://example.org/watch?v=xRh2sVcNXQ8" });
     expect(res.status).toBe(400);
-    expect(getVideoSource).not.toHaveBeenCalled();
+    expect(preparedSource).not.toHaveBeenCalled();
   });
 
   it("ends an unavailable-caption request before calling Gemini", async () => {
     const app = fixture();
-    vi.mocked(getVideoSource).mockRejectedValueOnce(new ApiError(422, "暂时无法读取字幕。"));
+    vi.mocked(preparedSource).mockRejectedValueOnce(new ApiError(422, "暂时无法读取字幕。"));
     const upstream = vi.fn();
     vi.stubGlobal("fetch", upstream);
     const result = await app.post("/api/articles", {url});

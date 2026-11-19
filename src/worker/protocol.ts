@@ -4,6 +4,8 @@ export type Summary = Record<'who' | 'what' | 'when' | 'where' | 'why' | 'how', 
 export const dimensions = ['who', 'what', 'when', 'where', 'why', 'how'] as const
 
 export interface Bindings {
+  CAPTION_CACHE: DurableObjectNamespace
+  CAPTION_LIMIT?: { limit(options: {key: string}): Promise<{success: boolean}> }
   ARTICLES: DurableObjectNamespace
   ASSETS: Fetcher
   GEMINI_API_KEY?: string
@@ -15,13 +17,13 @@ export class ApiError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
 }
 
-export function json(body: unknown, status = 200): Response {
-  return Response.json(body, {status, headers: {'Cache-Control': 'no-store'}})
+export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return Response.json(body, {status, headers: {...headers, 'Cache-Control': 'no-store'}})
 }
 
 export function failure(error: unknown): Response {
   return error instanceof ApiError
-    ? json({error: error.message}, error.status)
+    ? json({error: error.message, code: 'code' in error && typeof error.code === 'string' ? error.code : undefined}, error.status)
     : json({error: '请求暂时无法完成，请稍后再试。'}, 500)
 }
 
@@ -71,8 +73,7 @@ export async function requireEmptyBody(request: Request): Promise<void> {
 
 export interface Chapter {id: string; title: string; text: string}
 
-// Check new output at publication time. Stored articles from previous versions
-// may predate chapter recaps and can still be used for on-demand summaries.
+// Validate a newly completed chapter before it is stored and queued for summarization.
 export function requireChapterRecap(chapter: Chapter): void {
   const lastBreak = chapter.text.lastIndexOf('\n')
   if (lastBreak < 0 || !chapterRecapText(chapter.text.slice(lastBreak + 1)))

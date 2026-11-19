@@ -27,6 +27,7 @@ const topics = element<HTMLOListElement>('timeline-topics');
 const navSample = element<HTMLAnchorElement>('nav-sample');
 const navStudio = element<HTMLAnchorElement>('nav-studio');
 let pending: AbortController | null = null;
+let readerLifetime = new AbortController();
 let markdown = '';
 let frame = 0;
 let resultIsSample = false;
@@ -40,6 +41,8 @@ function switchNav(sample: boolean) {
   navStudio.classList.toggle('selected', !sample);
 }
 function openResult(sample: boolean) {
+  readerLifetime.abort();
+  readerLifetime = new AbortController();
   cancelAnimationFrame(frame);
   frame = 0;
   article.hidden = false;
@@ -48,8 +51,8 @@ function openResult(sample: boolean) {
   body.replaceChildren();
   copy.hidden = true;
   element('copy-label').textContent = '复制正文';
-  element('reader-mode').textContent = sample ? '排版样稿' : '已录视频 · 字幕记录';
-  title.textContent = sample ? '排版样稿' : '正在准备文章…';
+  element('reader-mode').textContent = sample ? '排版样稿 · 字幕节译' : '已录视频 · 根据字幕整理';
+  title.textContent = sample ? '排版样稿' : '正在准备字幕…';
   source.textContent = '';
   topics.replaceChildren();
   timeline.open = false;
@@ -63,8 +66,11 @@ function showSample() {
   if (pending) { tell('正在生成文章。如需切换到示例，请先停止生成。'); feedback.scrollIntoView({ block: 'center' }); return; }
   openResult(true);
   markdown = sampleMarkdown;
-  source.textContent = '原创试读稿 · 正文和六项总结均为预置示例。';
-  const render = createArticleRenderer(body, title, async id => sampleSummaries[id]);
+  const links = new Map<number, string>();
+  displaySource({source: 'archived-youtube', videoId: 'xRh2sVcNXQ8', title: '马克·安德森访谈原片',
+    timeline: [{at: '1:51'}, {at: '9:11'}]}, links);
+  source.append(' · 两章问答与 5W1H 均为预置样稿');
+  const render = createArticleRenderer(body, title, async id => sampleSummaries[id], links, readerLifetime.signal);
   render(markdown, sampleChapters);
   copy.hidden = false;
 }
@@ -84,12 +90,36 @@ input.addEventListener('input', () => {
 });
 stop.addEventListener('click', () => pending?.abort());
 
-async function loadSummary(articleId: string, chapterId: string): Promise<Summary> {
-  const response = await fetch('/api/articles/' + encodeURIComponent(articleId) + '/chapters/' + encodeURIComponent(chapterId) + '/summary', { method: 'POST' });
-  if (!response.ok) throw await responseError(response, '暂时无法生成总结');
-  const data = await response.json();
-  if (!data || summaryKeys.some(key => typeof data[key] !== 'string' || !data[key].trim())) throw new Error('总结格式异常，请重试。');
-  return data;
+function waitForRetry(retryAfter: string | null, signal: AbortSignal) {
+  const retryMs = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter || '') - Date.now();
+  const delay = Number.isFinite(retryMs) ? Math.min(2147483647, Math.max(1000, retryMs)) : 2000;
+  return new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', cancel);
+      resolve();
+    }, delay);
+    function cancel() {
+      window.clearTimeout(timer);
+      reject(signal.reason);
+    }
+    signal.addEventListener('abort', cancel, {once: true});
+  });
+}
+async function loadSummary(articleId: string, chapterId: string, signal: AbortSignal, onPending: () => void): Promise<Summary> {
+  const url = '/api/articles/' + encodeURIComponent(articleId) + '/chapters/' + encodeURIComponent(chapterId) + '/summary';
+  for (;;) {
+    const response = await fetch(url, {signal, cache: 'no-store'});
+    if (response.status === 202) {
+      onPending();
+      await waitForRetry(response.headers.get('Retry-After'), signal);
+      continue;
+    }
+    if (!response.ok) throw await responseError(response, '暂时无法读取本章总结');
+    const data = await response.json();
+    if (!data || summaryKeys.some(key => typeof data[key] !== 'string' || !data[key].trim())) throw new Error('总结格式异常，请重试。');
+    return data;
+  }
 }
 function setBusy(busy: boolean) {
   submit.disabled = busy;
@@ -97,11 +127,15 @@ function setBusy(busy: boolean) {
   input.readOnly = busy;
   requirements.readOnly = busy;
   element<HTMLButtonElement>('fill').disabled = busy;
-  element('submit-caption').textContent = busy ? '生成中…' : '开始生成';
+  element('submit-caption').textContent = busy ? '检查字幕中…' : '开始生成';
+  stop.textContent = busy ? '取消' : '停止生成';
 }
-function sourceName(kind: string) {
+function sourceName(kind: string, downloaded?: boolean) {
   if (kind === 'cached') return 'W3C WAI 官方存档字幕';
-  if (kind === 'archived-youtube') return 'YouTube 英文字幕存档';
+  if (kind === 'archived-youtube') return 'YouTube 英文字幕存档 · 服务端已预先下载';
+  if (kind === 'youtube' && downloaded !== undefined) {
+    return downloaded ? 'YouTube 视频字幕 · 已完整下载' : 'YouTube 视频字幕 · 已读取服务端下载缓存';
+  }
   return 'YouTube 视频字幕';
 }
 interface SourceMeta {
@@ -114,6 +148,33 @@ interface SourceMeta {
   timeline?: {at: string; topic?: string}[];
 }
 
+async function prepareCaptions(url: string, signal: AbortSignal) {
+  const check = () => fetch('/api/captions', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url}), signal,
+  });
+  let response = await check();
+  let downloaded = false;
+  let rechecked = false;
+  for (;;) {
+    if (!response.ok) throw await responseError(response, '字幕检查失败');
+    const data = await response.json();
+    if (!data || !/^[a-zA-Z0-9_-]{11}$/.test(data.videoId)) throw new Error('字幕状态无效，请重新检查。');
+    if (response.status === 200 && data.status === 'ready') return {source: data as SourceMeta, downloaded};
+    if (response.status !== 202 || !['pending', 'running'].includes(data.status)) throw new Error('字幕状态无效，请重新检查。');
+    downloaded = true;
+    element('submit-caption').textContent = '准备字幕中…';
+    status.textContent = data.status === 'pending' ? '已确认有字幕，正在等待下载…' : '已确认有字幕，正在下载完整字幕文件…';
+    await waitForRetry(response.headers.get('Retry-After'), signal);
+    response = await fetch('/api/captions/' + data.videoId, {signal, cache: 'no-store'});
+    if (response.status === 404 && !rechecked) {
+      rechecked = true;
+      downloaded = false;
+      status.textContent = '正在重新检查字幕下载状态…';
+      response = await check();
+    }
+  }
+}
+
 function timecode(seconds: number) {
   const total = Math.floor(seconds);
   const hh = Math.floor(total / 3600);
@@ -122,8 +183,10 @@ function timecode(seconds: number) {
   return hh ? hh + ':' + String(mm).padStart(2, '0') + ':' + ss : mm + ':' + ss;
 }
 
-function displaySource(meta: SourceMeta, links: Map<number, string>) {
-  source.textContent = sourceName(meta.source);
+function displaySource(meta: SourceMeta, links: Map<number, string>, downloaded?: boolean) {
+  source.textContent = sourceName(meta.source, downloaded);
+  topics.replaceChildren();
+  links.clear();
   const video = /^[a-zA-Z0-9_-]{11}$/.test(meta.videoId) ? 'https://www.youtube.com/watch?v=' + meta.videoId : '';
   if (video) {
     const link = document.createElement('a');
@@ -173,12 +236,13 @@ form.addEventListener('submit', async event => {
   setBusy(true);
   tell('');
   openResult(false);
-  status.textContent = '正在获取字幕并连接 Gemini…';
+  status.textContent = '正在检查可用字幕，确认后下载并开始写作…';
   let id = '';
+  let captionsReady = false;
   const readyChapters: Chapter[] = [];
   let complete = false;
   const links = new Map<number, string>();
-  const render = createArticleRenderer(body, title, chapter => loadSummary(id, chapter), links);
+  const render = createArticleRenderer(body, title, (chapter, signal, onPending) => loadSummary(id, chapter, signal, onPending), links, readerLifetime.signal);
   function paint() {
     frame = 0;
     render(markdown, readyChapters);
@@ -187,6 +251,13 @@ form.addEventListener('submit', async event => {
     if (!frame) frame = requestAnimationFrame(paint);
   }
   try {
+    const captions = await prepareCaptions(url, controller.signal);
+    captionsReady = true;
+    displaySource(captions.source, links, captions.downloaded);
+    status.textContent = '字幕已就绪，正在连接 Gemini…';
+    title.textContent = '正在准备文章…';
+    element('submit-caption').textContent = '生成中…';
+    stop.textContent = '停止生成';
     const response = await fetch('/api/articles', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -198,8 +269,8 @@ form.addEventListener('submit', async event => {
       const { type, data } = event;
       if (type === 'meta') {
         id = data.articleId;
-        displaySource(data, links);
-        status.textContent = '已取得字幕，正在等待 Gemini 输出正文…';
+        displaySource(data, links, captions.downloaded);
+        status.textContent = '字幕已就绪，正在等待 Gemini 输出正文…';
       } else if (type === 'delta' && typeof data.text === 'string') {
         if (!markdown) status.textContent = 'Gemini 正在写作…';
         markdown += data.text;
@@ -224,12 +295,14 @@ form.addEventListener('submit', async event => {
   } catch (error) {
     cancelAnimationFrame(frame);
     frame = 0;
-    const message = controller.signal.aborted ? '已停止生成。' : error instanceof Error ? error.message : '网络连接失败，请重试。';
+    const message = controller.signal.aborted
+      ? (captionsReady ? '已停止生成。' : '已取消本次字幕请求。')
+      : error instanceof Error ? error.message : '网络连接失败，请重试。';
     if (markdown.trim()) {
       render(markdown, readyChapters);
       status.textContent = message + ' 已保留收到的正文片段。';
       copy.hidden = false;
-    } else if (id) {
+    } else if (captionsReady) {
       title.textContent = '视频字幕记录';
       status.textContent = message;
     } else {

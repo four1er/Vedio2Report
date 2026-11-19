@@ -3,6 +3,7 @@ import { chapterRecapText } from '../shared/chapter-recap';
 export interface Chapter { id: string; title: string }
 export const summaryKeys = ['who', 'what', 'when', 'where', 'why', 'how'] as const;
 export type Summary = Record<typeof summaryKeys[number], string>;
+type LoadSummary = (chapterId: string, signal: AbortSignal, onPending: () => void) => Promise<Summary>;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) {
   const node = document.createElement(tag);
@@ -29,7 +30,7 @@ function summaryList(summary: Summary) {
   return dl;
 }
 
-function addSummary(heading: HTMLElement, chapter: Chapter, load: (id: string) => Promise<Summary>) {
+function addSummary(heading: HTMLElement, chapter: Chapter, load: LoadSummary, articleSignal: AbortSignal) {
   const button = el('button', '5W1H');
   button.type = 'button';
   button.className = 'summary-toggle';
@@ -37,31 +38,50 @@ function addSummary(heading: HTMLElement, chapter: Chapter, load: (id: string) =
   box.id = 'summary-' + chapter.id;
   box.className = 'summary-box';
   box.setAttribute('role', 'region');
+  box.setAttribute('aria-live', 'polite');
   box.setAttribute('aria-label', chapter.title + ' 5W1H 总结');
   box.hidden = true;
   button.setAttribute('aria-label', chapter.title + ' 5W1H 总结');
   button.setAttribute('aria-expanded', 'false');
   button.setAttribute('aria-controls', box.id);
+  button.dataset.state = 'available';
   let loaded = false;
-  let loading = false;
+  let request: AbortController | undefined;
   button.addEventListener('click', async () => {
     box.hidden = !box.hidden;
     button.setAttribute('aria-expanded', String(!box.hidden));
-    if (box.hidden || loaded || loading) return;
-    loading = true;
+    if (box.hidden) {
+      request?.abort();
+      if (!loaded) button.dataset.state = 'available';
+      return;
+    }
+    if (loaded || articleSignal.aborted) return;
+    const current = new AbortController();
+    request = current;
+    const signal = AbortSignal.any([articleSignal, current.signal]);
+    button.dataset.state = 'pending';
     box.setAttribute('aria-busy', 'true');
-    box.textContent = '正在整理本章总结…';
+    box.textContent = '正在读取本章总结…';
     try {
-      box.replaceChildren(summaryList(await load(chapter.id)));
+      const summary = await load(chapter.id, signal, () => {
+        box.textContent = '后台正在整理本章总结，完成后会自动显示。';
+      });
+      if (signal.aborted) return;
+      box.replaceChildren(summaryList(summary));
       loaded = true;
+      button.dataset.state = 'ready';
     } catch (error) {
+      if (signal.aborted) return;
+      button.dataset.state = 'failed';
       const retry = el('button', '重试');
       retry.className = 'text-button';
       retry.addEventListener('click', () => { box.hidden = true; button.click(); });
       box.replaceChildren(el('span', (error instanceof Error ? error.message : '总结加载失败。') + ' '), retry);
     } finally {
-      loading = false;
-      box.setAttribute('aria-busy', 'false');
+      if (request === current) {
+        request = undefined;
+        box.setAttribute('aria-busy', 'false');
+      }
     }
   });
   heading.append(button);
@@ -71,11 +91,25 @@ function addSummary(heading: HTMLElement, chapter: Chapter, load: (id: string) =
 function renderBlocks(raw: string, target: HTMLElement) {
   const fragment = document.createDocumentFragment();
   let paragraph: string[] = [];
+  let speaker = '';
+  let inSpeech = false;
   let list: HTMLOListElement | HTMLUListElement | null = null;
   function flush() {
     if (!paragraph.length) return;
     const p = el('p');
-    inline(p, paragraph.join(' '));
+    const text = paragraph.join(' ');
+    if (speaker) {
+      p.className = 'speaker-turn';
+      const label = el('strong', speaker + '：');
+      label.className = 'speaker-label';
+      const speech = el('span');
+      inline(speech, text);
+      p.append(label, ' ', speech);
+      speaker = '';
+    } else {
+      if (inSpeech) p.className = 'speaker-continuation';
+      inline(p, text);
+    }
     fragment.append(p);
     paragraph = [];
   }
@@ -84,14 +118,17 @@ function renderBlocks(raw: string, target: HTMLElement) {
     if (!value) { flush(); list = null; continue; }
     const heading = /^(#{1,6})[ \t]+(\S.*)$/.exec(line.trimEnd());
     const item = /^([-*+]\s+|\d+[.)]\s+)(.+)$/.exec(value);
+    const turn = /^\*\*([^*：:\n]{1,40}?)(?:[：:]\*\*|\*\*\s*[：:])\s*(.*)$/.exec(value);
     if (heading) {
       flush();
       list = null;
+      inSpeech = false;
       const h4 = el('h4');
       inline(h4, heading[2]);
       fragment.append(h4);
     } else if (item) {
       flush();
+      inSpeech = false;
       const tag = /^\d/.test(item[1]) ? 'ol' : 'ul';
       if (!list || list.localName !== tag) { list = el(tag); fragment.append(list); }
       const li = el('li');
@@ -100,6 +137,7 @@ function renderBlocks(raw: string, target: HTMLElement) {
     } else if (value.startsWith('>')) {
       flush();
       list = null;
+      inSpeech = false;
       const recap = chapterRecapText(value);
       if (recap !== undefined) {
         const block = el('p');
@@ -112,13 +150,27 @@ function renderBlocks(raw: string, target: HTMLElement) {
         inline(block, value.slice(1).trim());
         fragment.append(block);
       }
+    } else if (turn) {
+      flush();
+      list = null;
+      speaker = turn[1].trim();
+      inSpeech = true;
+      paragraph.push(turn[2]);
     } else {
       list = null;
+      if (inSpeech && value.startsWith('**') && !value.slice(2).includes('**')) flush();
       paragraph.push(value);
     }
   }
   flush();
-  target.replaceChildren(fragment);
+  // Keep completed paragraphs selectable while only the final turn grows.
+  const blocks = Array.from(fragment.children);
+  for (const [i, block] of blocks.entries()) {
+    const previous = target.children[i];
+    if (!previous) target.append(block);
+    else if (!previous.isEqualNode(block)) previous.replaceWith(block);
+  }
+  while (target.children.length > blocks.length) target.lastElementChild!.remove();
 }
 
 export function timestampSeconds(stamp: string): number | undefined {
@@ -156,7 +208,7 @@ interface ChapterView {
 
 // Chapter controls stay mounted while newer text is streaming, including when
 // an earlier summary request is still running or its button has keyboard focus.
-export function createArticleRenderer(target: HTMLElement, title: HTMLElement, load: (id: string) => Promise<Summary>, links = new Map<number, string>()) {
+export function createArticleRenderer(target: HTMLElement, title: HTMLElement, load: LoadSummary, links: ReadonlyMap<number, string>, articleSignal: AbortSignal) {
   const intro = el('div');
   target.replaceChildren(intro);
   const views: ChapterView[] = [];
@@ -194,7 +246,7 @@ export function createArticleRenderer(target: HTMLElement, title: HTMLElement, l
       }
       const chapter = chapters[i];
       if (chapter && chapter.title === name && !view.hasSummary) {
-        view.heading.after(addSummary(view.heading, chapter, load));
+        view.heading.after(addSummary(view.heading, chapter, load, articleSignal));
         view.hasSummary = true;
       }
     }
