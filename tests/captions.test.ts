@@ -215,3 +215,24 @@ describe('fetchYouTubeCaptions', () => {
     expect(result.text).toContain('Hello after proxy rotation')
   })
 })
+
+import { splitTranscriptSegments } from '../src/worker/gemini'
+
+describe('splitTranscriptSegments', () => {
+  it('keeps short transcripts and brief/scoped requirements single-pass', () => {
+    expect(splitTranscriptSegments('short text')).toHaveLength(1)
+    const archived = getArchivedTranscript('xRh2sVcNXQ8')!
+    expect(splitTranscriptSegments(archived.text, '写成 1000 字以内的商业简报')).toHaveLength(1)
+    expect(splitTranscriptSegments(archived.text, '只聚焦定价策略，分三章')).toHaveLength(1)
+  })
+
+  it('splits the 1h21m reference archive into 3 chronological topic-aligned macro-segments', () => {
+    const archived = getArchivedTranscript('xRh2sVcNXQ8')!
+    const parts = splitTranscriptSegments(archived.text)
+    expect(parts.length).toBe(3)
+    expect(parts[0].startsWith('[0:00')).toBe(true)
+    expect(parts[1].startsWith('[')).toBe(true)
+    expect(parts[2].startsWith('[')).toBe(true)
+    expect(parts[2]).toContain('Mars')
+  })
+})

@@ -54,7 +54,9 @@ src/
 
 核心实现见 [`src/worker/gemini.ts`](src/worker/gemini.ts)、[`src/worker/session.ts`](src/worker/session.ts) 与 [`src/web/reader.ts`](src/web/reader.ts)。
 
-- **单次全局上下文流式生成**：1 小时 20 分钟访谈的完整字幕仅约 2~3 万输入 token，远低于 Gemini 1M 上下文窗口；参考成稿约 8,400 字，亦远低于模型单次输出上限。因此直接将全片字幕与时间锚点一次传入 Gemini `streamGenerateContent?alt=sse`（默认模型 `gemini-3.1-flash-lite`，可通过 `GEMINI_MODEL` 覆盖），既保证了全片宏观分章质量，又将首字延迟压缩到 1~2 秒。
+- **自适应全局 / 分段宏观流式生成**：
+  - 中短视频（字幕 ≤ 42 KB，约 30 分钟以内）或指定简报/限字数/聚焦子话题时，采用**单次全局输入**直接调用 Gemini `streamGenerateContent?alt=sse`（默认模型 `gemini-3.1-flash-lite`，可通过 `GEMINI_MODEL` 覆盖），数秒完成全篇；
+  - 针对 1 小时以上的超长深度访谈（如 1h21m 安德森访谈），为避免轻量模型在单次超长输入下过度压缩后半段细节，自动沿时间轴/话题边界切分为 **2~4 个宏观大段**顺序流式续写（传递前文章节列表与结尾衔接片段，并剥离续写段首重复标题），既把首字耗时压至 2~3 秒，又能完整覆盖从开场到收尾（含结尾问答）的 7,000~10,000 字深度内容。
 - **端到端 SSE 实时推送与可视化指标**：Worker 解析上游 SSE 帧后立即以 `event: delta` 转发至浏览器；前端通过 `requestAnimationFrame` 合并渲染，使用纯 DOM 节点增量对比更新（杜绝 `innerHTML` XSS 风险，同时保持已生成段落可选中、不闪烁），并实时显示首字耗时、已生成字数与章节目录；成稿后支持一键**复制 Markdown** 或**导出排版完整的独立 HTML**（含已展开的 5W1H 总结）。
 - **流式章节 Checkpoint**：服务端实时扫描已抵达的完整行，每当新的 `## ` 章节标题出现，立即将上一已完成章节持久化到 Durable Object 并推送 `event: chapter`，读者在后续章节仍在流式生成时即可提前点击已完成章节的 `[5W1H]` 按钮。
 
