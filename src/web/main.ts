@@ -1,7 +1,8 @@
 import './style.css';
 import { applyIcons } from './icons';
-import { createArticleRenderer, timestampSeconds, summaryKeys, type Chapter, type Summary } from './reader';
-import { events, responseError } from './stream';
+import { createArticleRenderer, timestampSeconds, type Chapter } from './reader';
+import { events, responseError, waitForRetry } from './stream';
+import { loadSummary } from './summary';
 import { sampleMarkdown, sampleChapters, sampleSummaries } from './sample';
 
 applyIcons();
@@ -90,37 +91,6 @@ input.addEventListener('input', () => {
 });
 stop.addEventListener('click', () => pending?.abort());
 
-function waitForRetry(retryAfter: string | null, signal: AbortSignal) {
-  const retryMs = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter || '') - Date.now();
-  const delay = Number.isFinite(retryMs) ? Math.min(2147483647, Math.max(1000, retryMs)) : 2000;
-  return new Promise<void>((resolve, reject) => {
-    signal.throwIfAborted();
-    const timer = window.setTimeout(() => {
-      signal.removeEventListener('abort', cancel);
-      resolve();
-    }, delay);
-    function cancel() {
-      window.clearTimeout(timer);
-      reject(signal.reason);
-    }
-    signal.addEventListener('abort', cancel, {once: true});
-  });
-}
-async function loadSummary(articleId: string, chapterId: string, signal: AbortSignal, onPending: () => void): Promise<Summary> {
-  const url = '/api/articles/' + encodeURIComponent(articleId) + '/chapters/' + encodeURIComponent(chapterId) + '/summary';
-  for (;;) {
-    const response = await fetch(url, {signal, cache: 'no-store'});
-    if (response.status === 202) {
-      onPending();
-      await waitForRetry(response.headers.get('Retry-After'), signal);
-      continue;
-    }
-    if (!response.ok) throw await responseError(response, '暂时无法读取本章总结');
-    const data = await response.json();
-    if (!data || summaryKeys.some(key => typeof data[key] !== 'string' || !data[key].trim())) throw new Error('总结格式异常，请重试。');
-    return data;
-  }
-}
 function setBusy(busy: boolean) {
   submit.disabled = busy;
   stop.hidden = !busy;
@@ -242,7 +212,7 @@ form.addEventListener('submit', async event => {
   const readyChapters: Chapter[] = [];
   let complete = false;
   const links = new Map<number, string>();
-  const render = createArticleRenderer(body, title, (chapter, signal, onPending) => loadSummary(id, chapter, signal, onPending), links, readerLifetime.signal);
+  const render = createArticleRenderer(body, title, (chapter, signal, onStatus) => loadSummary(id, chapter, signal, onStatus), links, readerLifetime.signal);
   function paint() {
     frame = 0;
     render(markdown, readyChapters);

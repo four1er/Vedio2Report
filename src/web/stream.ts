@@ -27,3 +27,20 @@ export async function responseError(response: Response, fallback: string) {
   const json = await response.json().catch(() => null);
   return new Error(typeof json?.error === 'string' ? json.error : fallback + '（HTTP ' + response.status + '）');
 }
+
+export function waitForRetry(retryAfter: string | null, signal: AbortSignal, defaultDelay = 2000) {
+  const retryMs = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter || '') - Date.now();
+  const delay = Number.isFinite(retryMs) ? Math.min(2147483647, Math.max(1000, retryMs)) : defaultDelay;
+  return new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', cancel);
+      resolve();
+    }, delay);
+    function cancel() {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }
+    signal.addEventListener('abort', cancel, {once: true});
+  });
+}

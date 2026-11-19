@@ -1,4 +1,5 @@
-import type { Chapter, Summary } from './reader';
+import type { Chapter } from './reader';
+import type { Summary } from './summary';
 
 export const sampleChapters: Chapter[] = [
   { id: 'ch-1', title: '[1:51] AI 革命走到哪一步了？' },

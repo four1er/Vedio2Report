@@ -1,9 +1,8 @@
+import { summaryKeys, type Summary, type SummaryProgress } from './summary';
 import { chapterRecapText } from '../shared/chapter-recap';
 
 export interface Chapter { id: string; title: string }
-export const summaryKeys = ['who', 'what', 'when', 'where', 'why', 'how'] as const;
-export type Summary = Record<typeof summaryKeys[number], string>;
-type LoadSummary = (chapterId: string, signal: AbortSignal, onPending: () => void) => Promise<Summary>;
+type LoadSummary = (chapterId: string, signal: AbortSignal, onStatus: (state: SummaryProgress) => void) => Promise<Summary>;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) {
   const node = document.createElement(tag);
@@ -63,8 +62,10 @@ function addSummary(heading: HTMLElement, chapter: Chapter, load: LoadSummary, a
     box.setAttribute('aria-busy', 'true');
     box.textContent = '正在读取本章总结…';
     try {
-      const summary = await load(chapter.id, signal, () => {
-        box.textContent = '后台正在整理本章总结，完成后会自动显示。';
+      const summary = await load(chapter.id, signal, state => {
+        if (signal.aborted) return;
+        const message = state === 'pending' ? '后台正在整理本章总结，完成后会自动显示。' : '暂时无法读取本章总结，正在自动重连…';
+        if (box.textContent !== message) box.textContent = message;
       });
       if (signal.aborted) return;
       box.replaceChildren(summaryList(summary));
@@ -73,10 +74,7 @@ function addSummary(heading: HTMLElement, chapter: Chapter, load: LoadSummary, a
     } catch (error) {
       if (signal.aborted) return;
       button.dataset.state = 'failed';
-      const retry = el('button', '重试');
-      retry.className = 'text-button';
-      retry.addEventListener('click', () => { box.hidden = true; button.click(); });
-      box.replaceChildren(el('span', (error instanceof Error ? error.message : '总结加载失败。') + ' '), retry);
+      box.textContent = error instanceof Error ? error.message : '本章总结暂不可用。';
     } finally {
       if (request === current) {
         request = undefined;

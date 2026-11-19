@@ -349,10 +349,11 @@ describe("Worker article workflow", () => {
     expect(scheduled).toBeGreaterThanOrEqual(start + 70_000);
     app.restart(id);
     await app.alarm(id);
-    for (let i = 0; i < 4; i++) {
-      const pending = await app.get(path);
+    clock.mockReturnValue(scheduled - 65_000);
+    for (const waitingPath of [path, path.replace("ch-1", "ch-2"), path]) {
+      const pending = await app.get(waitingPath);
       expect(pending.status).toBe(202);
-      expect(pending.headers.get("Retry-After")).toBe("2");
+      expect(pending.headers.get("Retry-After")).toBe("65");
       expect(await pending.json()).toEqual({status: "pending"});
     }
     expect(calls).toBe(1);
@@ -414,10 +415,68 @@ describe("Worker article workflow", () => {
     await app.alarm(id);
     await app.alarm(id);
     const path = "/api/articles/" + id + "/chapters/ch-1/summary";
-    expect((await app.get(path)).status).toBe(502);
+    const failure = await app.get(path);
+    expect(failure.status).toBe(502);
+    expect(await failure.json()).toMatchObject({code: "SUMMARY_FAILED", error: expect.stringContaining("章末小结")});
     expect((await app.get(path.replace("ch-1", "ch-2"))).status).toBe(200);
     expect((await app.post(path)).status).toBe(502);
     expect(calls).toBe(2);
+  });
+
+  it.each([true, false])("automatically retries truncated 5W1H up to a fixed limit (provider recovers: %s)", async (recovers) => {
+    const app = fixture();
+    const clock = vi.spyOn(Date, "now");
+    let summaryCalls = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Request(input, init).url.includes(":streamGenerateContent"))
+        return new Response(geminiFrame(firstPart, "STOP"));
+      summaryCalls++;
+      const complete = recovers && summaryCalls > 1;
+      const candidate = {content: {parts: [{text: complete ? JSON.stringify(summary) : "{"}]}, finishReason: complete ? "STOP" : "MAX_TOKENS"};
+      return Response.json({candidates: [candidate]});
+    });
+    const stream = readEvents(await app.post("/api/articles", {url}));
+    const id = (await stream.next()).data.articleId;
+    while ((await stream.next()).event !== "done") { /* consume SSE */ }
+    const store = app.stores.get(id)!;
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    const attempts = recovers ? 2 : 3;
+    for (let i = 1; i <= attempts; i++) {
+      await app.alarm(id);
+      expect(summaryCalls).toBe(i);
+      if (i < attempts) {
+        expect((await app.get(path)).status).toBe(202);
+        expect(summaryCalls).toBe(i);
+        app.restart(id);
+        clock.mockReturnValue((await store.getAlarm())!);
+      }
+    }
+    await app.alarm(id);
+    const final = await app.get(path);
+    expect(final.status).toBe(recovers ? 200 : 502);
+    expect(await final.json()).toMatchObject(recovers ? summary : {code: "SUMMARY_FAILED"});
+    expect(summaryCalls).toBe(attempts);
+  });
+
+  it("returns an actionable terminal result for a failed chapter saved before the upgrade", async () => {
+    const app = fixture();
+    const id = "a".repeat(64);
+    app.bindings.ARTICLES.get(id);
+    const store = app.stores.get(id)!;
+    const expiresAt = Date.now() + 60000;
+    await store.put({session: {expiresAt}, "failed/ch-1": "总结格式异常，请重试。"});
+    await store.setAlarm(expiresAt);
+    const upstream = vi.fn();
+    vi.stubGlobal("fetch", upstream);
+    const path = "/api/articles/" + id + "/chapters/ch-1/summary";
+    for (const response of [await app.get(path), await app.post(path)]) {
+      expect(response.status).toBe(502);
+      const body = await response.json() as {code: string; error: string};
+      expect(body.code).toBe("SUMMARY_FAILED");
+      expect(body.error).not.toContain("重试");
+    }
+    expect(await store.getAlarm()).toBe(expiresAt);
+    expect(upstream).not.toHaveBeenCalled();
   });
 
   it("expires an in-flight summary and prevents its late result from recreating a deleted session", async () => {

@@ -146,7 +146,13 @@ export class ArticleSession {
     const session = values.get('session') as Session | undefined
     if (!session || session.expiresAt <= Date.now()) throw new ApiError(404, '未找到文章或文章已过期，请重新生成。')
     if (values.has(key)) return json(values.get(key))
-    if (values.has(failed)) throw new ApiError(502, String(values.get(failed)))
+    // Older sessions store failures as strings, including advice to retry. Re-reading
+    // this endpoint cannot restart a finished task, regardless of its storage version.
+    if (values.has(failed)) return json({
+      code: 'SUMMARY_FAILED',
+      error: '本章的 5W1H 未能生成。你可以继续阅读本章正文和章末小结。',
+      reason: values.get(failed),
+    }, 502)
     const queue = values.get('queue') as SummaryQueue | undefined
     if (!queue) {
       const article = await this.state.storage.get<string>('article')
@@ -155,7 +161,11 @@ export class ArticleSession {
     }
     const number = Number(id.slice(3))
     if (!queue || number > queue.published) throw new ApiError(404, '该章节尚未写完或不存在。')
-    return json({status: number === queue.next && queue.running ? 'running' : 'pending'}, 202, {'Retry-After': '2'})
+    // While the upstream is backing off, subsequent chapters wait behind this job too.
+    // A running job may finish at any moment; its wakeAt is only a crash watchdog.
+    const nextCheck = Math.min(queue.wakeAt, session.expiresAt)
+    const waitSeconds = queue.running ? 2 : Math.max(2, Math.ceil((nextCheck - Date.now()) / 1000))
+    return json({status: number === queue.next && queue.running ? 'running' : 'pending'}, 202, {'Retry-After': String(waitSeconds)})
   }
 
   async alarm(): Promise<void> {

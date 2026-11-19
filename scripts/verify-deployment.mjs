@@ -234,9 +234,15 @@ async function verifySummary(panel, data) {
 
 async function verifyPendingPanel(page, button, secondPath) {
   let replayedPending = false;
+  let reads = 0;
   // A fast background job may be done before the reader opens chapter two.
   // In that case exercise one 202 explicitly, then use the real cached GET.
   await page.route(secondPath, async route => {
+    if (++reads === 2) {
+      await route.fulfill({status: 503, contentType: 'text/plain', headers: {'Retry-After': '1'},
+        body: 'Upstream temporarily unavailable'});
+      return;
+    }
     const response = await route.fetch();
     if (response.status() === 200) {
       replayedPending = true;
@@ -246,7 +252,7 @@ async function verifyPendingPanel(page, button, secondPath) {
       await route.fulfill({response});
     }
     await response.dispose();
-  }, {times: 1});
+  }, {times: 2});
   const firstRead = page.waitForResponse(res => res.url() === secondPath, {timeout: 30000});
   await button.click();
   assert.equal((await firstRead).status(), 202, 'Expected the initially opened second panel to be pending');
@@ -255,6 +261,7 @@ async function verifyPendingPanel(page, button, secondPath) {
   assert.ok(await secondBox.isVisible());
   assert.equal(await button.getAttribute('data-state'), 'pending');
   const secondReady = await readyRead;
+  assert.equal(reads, 2, 'Expected automatic recovery from the injected read failure');
   await verifySummary(secondBox, await secondReady.json());
   assert.equal(await button.getAttribute('aria-expanded'), 'true', 'The open pending panel should populate on its own');
   assert.equal(await button.getAttribute('data-state'), 'ready');
@@ -492,7 +499,7 @@ async function verifyPage(browser) {
   const viewportEvidence = partial.length > 1
     ? `首屏正文 ${partial[0].ms} ms 可读，结束前屏内正文从 ${partial[0].chars} 增至 ${partial.at(-1).chars} 个字符，共 ${partial.length} 次可见增长`
     : `结束前记录到 ${partial.length} 次屏内段落采样`;
-  const pendingEvidence = !hasSecond ? '这次只生成一章，未测第二章的等待交互' : replayedPending ? '第二章已缓存，重放一次 202 后，打开的面板自动读到真实缓存' : '第二章首次读取返回 202，打开的面板随后自动填入后台结果';
+  const pendingEvidence = !hasSecond ? '这次只生成一章，未测第二章的等待交互' : replayedPending ? '第二章已缓存，模拟一次 202 和一次 503 后，面板自动读到真实结果' : '第二章首次读取返回 202，下一次读取模拟一次 503，面板随后自动填入真实后台结果';
   const evidence = `视频 ${videoId}，来源 ${meta.source}，${viewportEvidence}。全文 ${durationMs} ms，${deltas} 个增量事件，共 ${chapters.length} 章。${interviewEvidence}首章封存在 ${firstReadyMs} ms 可见。页面从未读取 5W1H 时，独立 GET 已读到首章六项缓存；点击后显示了相同结果。${pendingEvidence}。`;
   console.log(evidence);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY,

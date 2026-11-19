@@ -39,7 +39,9 @@ Worker 在服务端调用 Gemini REST 的 `streamGenerateContent?alt=sse`，默�
 GET /api/articles/{articleId}/chapters/{chapterId}/summary
 ```
 
-准备就绪时返回 HTTP 200 和 `who`、`what`、`when`、`where`、`why`、`how` 六个字符串。任务排队或运行中时返回 HTTP 202 和 `Retry-After`。已展开的面板会自动更新，准备好后按六个固定字段显示。后台任务会在对象重启后继续，临时错误按退避时间重试。旧版文章已有的六项缓存仍可读取，尚未预计算的旧章会提示重新生成文章。字幕未交代的事项标为「本章未提及」。[任务调度与缓存](src/worker/session.ts) · [总结面板](src/web/reader.ts)
+准备就绪时返回 HTTP 200 和 `who`、`what`、`when`、`where`、`why`、`how` 六个字符串。任务排队或运行中时返回 HTTP 202 和 `Retry-After`。若模型答复截断或缺少字段，后台会退避重试，最多执行三轮任务，对象重启后也能继续。字幕未交代的事项标为「本章未提及」。[任务调度与缓存](src/worker/session.ts)
+
+面板展开期间，遇到网络中断或临时网关错误会自动重连，只读取该章的状态。用户可以继续读正文，收起面板即停止轮询，再次打开已读章节直接显示六项。后台已终止的任务返回 `SUMMARY_FAILED`，页面提示读者查看章末小结。旧文章缺少预生成结果或已过保存期限时，页面说明需要重新生成文章。[读取与重连](src/web/summary.ts) · [总结面板](src/web/reader.ts)
 
 ## 5. 主要工程取舍与亮点
 

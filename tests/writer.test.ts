@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getVideoSource, type Video } from "../src/worker/captions";
-import { summarize, writeArticle } from "../src/worker/gemini";
+import { summarize, TransientError, writeArticle } from "../src/worker/gemini";
 import type { Bindings } from "../src/worker/protocol";
 import { cachedCaptions, cachedVideoId } from "../src/worker/sample";
 
@@ -320,6 +320,41 @@ it("also retries a temporary HTTP failure on the non-streaming 5W1H endpoint", a
   expect(result).toEqual(summary);
   expect(fetcher).toHaveBeenCalledTimes(2);
   expect(fetcher.mock.calls.every(([url]) => String(url).includes(":generateContent"))).toBe(true);
+});
+
+describe("background 5W1H response failures", () => {
+  const chapter = {id: "ch-2", title: last.title, text: last.body};
+  function run() { return summarize(env, video, last.body, chapter, signal()); }
+
+  it.each([
+    ["truncated answer", {candidates: [{finishReason: "MAX_TOKENS", content: {parts: [{text: '{"who":"研究员"'}]}}]}],
+    ["empty candidate list", {candidates: []}],
+    ["invalid JSON", {candidates: [{finishReason: "STOP", content: {parts: [{text: "{"}]}}]}],
+    ["missing fields", {candidates: [{finishReason: "STOP", content: {parts: [{text: '{"who":"研究员"}'}]}}]}],
+  ])("passes a %s to the durable retry queue after a single generation", async (_name, payload) => {
+    const fetcher = vi.fn(async () => Response.json(payload));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(run()).rejects.toBeInstanceOf(TransientError);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries if the translated explanation still fails the language check", async () => {
+    const english = {who: "Researcher", what: "Measure", when: "Dawn", where: "Sea", why: "Compare", how: "Sample"};
+    const fetcher = vi.fn(async () => Response.json({candidates: [{finishReason: "STOP", content: {parts: [{text: JSON.stringify(english)}]}}]}));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(run()).rejects.toBeInstanceOf(TransientError);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    {promptFeedback: {blockReason: "SAFETY"}},
+    {candidates: [{finishReason: "SAFETY"}]},
+  ])("does not retry a blocked prompt or answer", async payload => {
+    const fetcher = vi.fn(async () => Response.json(payload));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(run()).rejects.not.toBeInstanceOf(TransientError);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("unstructured article streaming", () => {
