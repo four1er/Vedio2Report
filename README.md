@@ -19,8 +19,8 @@ src/
 │   ├── proxy-http.ts        # Cloudflare TCP Socket + HTTP CONNECT 代理客户端与代理池解析
 │   ├── captions.ts          # YouTube 字幕解析（Android Innertube + Watch Page + 硬编码兜底）
 │   ├── caption-cache.ts     # CaptionCache Durable Object（24h 字幕缓存 + 并发去重）
-│   ├── gemini.ts            # Gemini 调用：4D 意图解析 / 全局流式正文 / 章节 5W1H JSON
-│   ├── session.ts           # ArticleSession Durable Object（上下文持久化 + 按需 5W1H 缓存）
+│   ├── gemini.ts            # Gemini 调用：4D 意图解析 / 全局流式正文 / 单章与批量 5W1H JSON
+│   ├── session.ts           # ArticleSession Durable Object（上下文持久化 + 后台批量预热与按需 5W1H 缓存）
 │   └── archives/            # 构建期校验并准备的示例视频兜底字幕（xRh2sVcNXQ8）
 └── web/
     ├── main.ts              # 表单交互、快捷要求预设、SSE 流式消费与约束标签渲染
@@ -81,7 +81,7 @@ src/
 
 ## 4. 如何实现章节级 5W1H 总结
 
-核心实现见 [`src/worker/session.ts`](src/worker/session.ts) 与 [`src/web/reader.ts`](src/web/reader.ts)。
+核心实现见 [`src/worker/session.ts`](src/worker/session.ts)、[`src/worker/gemini.ts`](src/worker/gemini.ts) 与 [`src/web/reader.ts`](src/web/reader.ts)。
 
 - **服务端上下文持久化**：每次文章生成会创建独立的 SQLite Durable Object（`ArticleSession`），持久化保存完整视频字幕、已生成正文及分章列表（24 小时后由 `alarm()` 自动清理）。
 - **严格零正文重传**：点击章节标题旁 `[5W1H]` 按钮时，前端仅发送空请求体调用：
@@ -89,10 +89,9 @@ src/
   POST /api/articles/{articleId}/chapters/{chapterId}/summary
   ```
   服务端通过 `requireEmptyBody()` 强制校验请求体为空，绝不由前端重新提交文章或字幕内容。
-- **按需生成 + 并发去重 + 持久化缓存**：
-  - 服务端优先读取 Durable Object 中的 `summary/{chapterId}` 缓存（命中返回 `X-Summary-Cache: HIT`）。
-  - 未命中时，结合服务端保存的**完整视频字幕 + 完整文章 + 当前目标章节**调用 Gemini Structured Output（强制返回 `who` / `what` / `when` / `where` / `why` / `how` 六个非空字符串字段；未提及项标为「本章未提及」），写入持久化缓存后返回。
-  - 内存 `inflightSummaries` Map 对同一章节的并发点击去重，避免重复扣减 API 配额。
+- **全文完成后后台 1 次批量预热 + 按需兜底 + 并发去重**：
+  - **后台单次批量预热**：全文流式完成后，Durable Object 通过 `alarm()` 在后台异步触发 **1 次** `summarizeAllChapters5W1H` 调用，基于服务端保存的**完整视频字幕 + 完整文章**，一次性为所有尚未缓存的章节生成结构化 5W1H JSON 并写入 `summary/{chapterId}` 持久化缓存；读者随后点击任意章节均直接命中缓存（`X-Summary-Cache: HIT`），实现秒开。
+  - **流式中途按需生成 & 失败无缝降级**：若读者在文章尚未全部流式完成前就提前点击已完成章节，或后台预热因限流未覆盖某章，服务端会自动复用进行中的预热 Promise 或回退至单章 `summarizeChapter5W1H`（结合完整字幕、全文与目标章节正文生成 `who` / `what` / `when` / `where` / `why` / `how` 六个非空字段；未提及项标为「本章未提及」），并通过 `inflightSummaries` 对同章并发点击去重。
 - **固定格式渲染**：前端将返回 JSON 固定渲染为六行结构化卡片（Who / What / When / Where / Why / How），收起后再次展开直接复用已加载内容。
 
 ---
@@ -103,7 +102,7 @@ src/
 | --- | --- |
 | **边缘代理可靠性** | 面对 Cloudflare Workers `fetch()` 不支持代理以及 `startTls()` 生产边缘缺失 SNI 的限制，自研 ~300 行纯 WebCrypto TLS 1.3 + HTTP CONNECT 传输层，零第三方加密大依赖、CPU 耗时 <1 ms，且通过真实 OpenSSL TLS 1.3 与 `workerd` 集成测试验证。 |
 | **简洁架构 vs 过度设计** | 摒弃复杂的多轮分批 JSON 编号校验与脆弱正则分类，利用 Gemini 长上下文与原生流式 Markdown 直出，大幅精简代码并显著缩短长视频生成耗时，模块边界清晰易维护。 |
-| **按需 5W1H vs 后台全量预计算** | 改为用户点击时按需生成 + Durable Object 持久缓存 + 并发去重：既不浪费 Gemini AI Studio 免费日配额，又能让用户任意优先点击靠后的章节立即出结果。 |
+| **单次批量后台预热 + 按需兜底** | 相比「N 次串行后台预热」（耗时久且耗尽 RPM 配额）和「纯点击后现算」（首次点击需等待），本方案在全文完成后通过 DO `alarm()` 仅发起 **1 次**全章批量 5W1H 预热写入持久缓存，既实现读后点击秒开，又保留流式中途按需触发、在途请求合并与限流失败无感降级能力。 |
 | **可解释的四维度要求解析** | 用结构化 Schema 将自由自然语言收敛到任务类型、输出风格、目标受众、约束条件四个可控维度，并在页面可视化展示生效约束，兼具工程可控性与产品体验。 |
 
 ---
