@@ -26,7 +26,6 @@ src/
     ├── main.ts              # 表单交互、快捷要求预设、SSE 流式消费与约束标签渲染
     ├── reader.ts            # 纯 DOM 增量 Markdown 渲染器、动态章节目录与 5W1H 面板
     ├── stream.ts            # 浏览器端 SSE 解析器
-    ├── sample.ts            # 参考排版样稿与 5W1H 示例
     └── style.css            # 编辑部暖纸排版样式
 ```
 

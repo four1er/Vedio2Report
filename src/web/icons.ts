@@ -5,7 +5,6 @@ const paths: Record<string, string> = {
   corner: '<path d="M19 5v5a3 3 0 0 1-3 3H5m4-4-4 4 4 4"/>',
   arrow: '<path d="M4 12h15m-6-6 6 6-6 6"/>',
   'arrow-up-right': '<path d="M6 18 18 6M8 6h10v10"/>',
-  book: '<path d="M3 5c3-1 6 0 9 2 3-2 6-3 9-2v14c-3-1-6 0-9 2-3-2-6-3-9-2zM12 7v14"/>',
   copy: '<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h4"/>',
   download: '<path d="M12 3v12m0 0-4-4m4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
   sparkles: '<path d="M11 2c1.1 6.2 3.4 8.5 9.6 9.6-6.2 1.1-8.5 3.4-9.6 9.6-1.1-6.2-3.4-8.5-9.6-9.6C7.6 10.5 9.9 8.2 11 2Z" fill="currentColor" stroke="none"/>',

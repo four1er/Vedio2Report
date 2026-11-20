@@ -18,7 +18,6 @@
         </a>
         <nav aria-label="主导航">
           <a href="#studio" id="nav-studio" class="nav-item selected">写作台</a>
-          <a href="#article" id="nav-sample" class="nav-item">排版样稿</a>
           <a class="repo" href="https://github.com/four1er/Vedio2Report" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看项目">
             <span data-icon="github"></span><span>GitHub</span><span data-icon="arrow-up-right"></span>
           </a>
@@ -49,6 +48,9 @@
           <form id="generate">
             <div class="label-row">
               <label for="video">YouTube 视频链接</label>
+              <button id="fill" class="text-button" type="button">
+                填入示例链接<span data-icon="corner"></span>
+              </button>
             </div>
             <div class="input-wrap">
               <span data-icon="link"></span>
@@ -104,27 +106,6 @@
             <p id="feedback" role="alert" hidden></p>
           </form>
         </section>
-
-        <aside class="sample-card panel" aria-labelledby="sample-title">
-          <div class="cover" aria-hidden="true">
-            <span class="cover-word">AI</span>
-            <span class="record"><i></i></span>
-            <span class="wave"></span>
-          </div>
-          <div class="sample-copy">
-            <p class="eyebrow"><span class="small-dot"></span>参考示例</p>
-            <h2 id="sample-title">对话安德森：AI革命的万亿美金之问</h2>
-            <p class="sample-description">对照参考排版与 5W1H 结构，或一键填入该视频链接体验真实流式生成。</p>
-            <div class="sample-actions">
-              <button id="sample" class="read-button" type="button">
-                <span data-icon="book"></span>阅读样稿<span data-icon="arrow"></span>
-              </button>
-              <button id="fill" class="text-button" type="button">
-                填入示例链接<span data-icon="corner"></span>
-              </button>
-            </div>
-          </div>
-        </aside>
       </div>
 
       <section id="article" class="reader panel" hidden aria-labelledby="reader-title">
