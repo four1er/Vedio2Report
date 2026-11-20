@@ -1,6 +1,11 @@
 import type { ArticleMeta, ParsedRequirements, Summary5W1H } from '../shared/types'
 import type { VideoTranscript } from './captions'
-import { parseUserRequirements, streamArticle, summarizeChapter5W1H } from './gemini'
+import {
+  parseUserRequirements,
+  streamArticle,
+  summarizeAllChapters5W1H,
+  summarizeChapter5W1H,
+} from './gemini'
 import {
   ApiError,
   chapterHeadings,
@@ -13,6 +18,8 @@ import {
 } from './protocol'
 
 const SESSION_TTL_MS = 24 * 60 * 60_000
+const PREWARM_DELAY_MS = 50
+const MAX_BATCH_PREWARM_CHAPTERS = 40
 const encoder = new TextEncoder()
 
 interface StoredSession {
@@ -20,6 +27,7 @@ interface StoredSession {
   videoTitle: string
   requirements: string
   parsedRequirements?: ParsedRequirements
+  prewarmPending?: boolean
   expiresAt: number
 }
 
@@ -63,10 +71,15 @@ function sseResponse(events: AsyncGenerator<SseEvent>, controller: AbortControll
  * Per-article Durable Object:
  * 1. Persists full video transcript, generated article, and chapter boundaries server-side.
  * 2. Streams the main article via SSE while incrementally checkpointing completed chapters.
- * 3. Generates chapter-level 5W1H summaries on demand from server context with storage caching & dedup.
+ * 3. Pre-warms all remaining chapter 5W1H summaries in one background batch call via alarm()
+ *    after article completion, while keeping immediate on-demand generation & dedup fallback.
  */
 export class ArticleSession {
   private readonly inflightSummaries = new Map<string, Promise<Summary5W1H>>()
+  private activePrewarm?: {
+    promise: Promise<Record<string, Summary5W1H>>
+    chapterIds: ReadonlySet<string>
+  }
 
   constructor(
     private readonly state: DurableObjectState,
@@ -170,12 +183,14 @@ export class ArticleSession {
       }
     }
 
-    // Finalize full article and all remaining chapters.
+    // Finalize full article and schedule one background batch 5W1H pre-warm via DO alarm().
     const finalChapters = extractChapters(article)
     if (!finalChapters.length) {
       throw new ApiError(502, '生成的文章未包含有效章节结构，请重试。')
     }
-    await this.state.storage.put({ article, chapters: finalChapters })
+    session.prewarmPending = true
+    await this.state.storage.put({ session, article, chapters: finalChapters })
+    await this.state.storage.setAlarm(Date.now() + PREWARM_DELAY_MS)
 
     for (let i = emittedChapters; i < finalChapters.length; i++) {
       yield ['chapter', { id: finalChapters[i].id, title: finalChapters[i].title }]
@@ -186,6 +201,7 @@ export class ArticleSession {
 
   private async handleSummary(chapterId: string, signal: AbortSignal): Promise<Response> {
     const cacheKey = `summary/${chapterId}`
+    const prewarmBeforeRead = this.activePrewarm
     const stored = await this.state.storage.get(['session', 'transcript', 'article', 'chapters', cacheKey])
     const session = stored.get('session') as StoredSession | undefined
 
@@ -202,6 +218,15 @@ export class ArticleSession {
     const chapter = chapters.find(item => item.id === chapterId)
     if (!chapter) {
       throw new ApiError(404, '该章节尚未生成完成或不存在。', 'CHAPTER_NOT_FOUND')
+    }
+
+    // Piggyback on in-flight background batch pre-warm instead of firing a duplicate Gemini request.
+    const prewarm = this.activePrewarm ?? prewarmBeforeRead
+    if (prewarm?.chapterIds.has(chapterId)) {
+      const batch = await raceAbort(prewarm.promise, signal)
+      if (batch[chapterId]) {
+        return json(batch[chapterId], 200, { 'X-Summary-Cache': 'HIT' })
+      }
     }
 
     const transcriptText = (stored.get('transcript') as string | undefined) ?? ''
@@ -237,9 +262,65 @@ export class ArticleSession {
     const session = await this.state.storage.get<StoredSession>('session')
     if (!session || session.expiresAt <= Date.now()) {
       await this.state.storage.deleteAll()
-    } else {
-      await this.state.storage.setAlarm(session.expiresAt)
+      return
     }
+
+    if (!session.prewarmPending) {
+      await this.state.storage.setAlarm(session.expiresAt)
+      return
+    }
+
+    // Clear prewarmPending and restore 24h TTL cleanup alarm first so prewarm never retry-loops.
+    session.prewarmPending = false
+    await this.state.storage.put('session', session)
+    await this.state.storage.setAlarm(session.expiresAt)
+
+    const stored = await this.state.storage.get(['transcript', 'article', 'chapters'])
+    const chapters = (stored.get('chapters') as Chapter[] | undefined) ?? []
+    if (!chapters.length) return
+
+    const existing = await this.state.storage.get(chapters.map(ch => `summary/${ch.id}`))
+    const uncached = chapters
+      .filter(ch => !existing.has(`summary/${ch.id}`) && !this.inflightSummaries.has(ch.id))
+      .slice(0, MAX_BATCH_PREWARM_CHAPTERS)
+    if (!uncached.length) return
+
+    const transcriptText = (stored.get('transcript') as string | undefined) ?? ''
+    const articleText = (stored.get('article') as string | undefined) ?? ''
+
+    const chapterIds = new Set(uncached.map(ch => ch.id))
+    const promise = (async (): Promise<Record<string, Summary5W1H>> => {
+      try {
+        const summaries = await summarizeAllChapters5W1H(
+          this.env,
+          {
+            videoTitle: session.videoTitle,
+            transcriptText,
+            articleText,
+            chapters: uncached,
+          },
+          AbortSignal.timeout(90_000),
+        )
+        const entries: Record<string, Summary5W1H> = {}
+        for (const [id, summary] of Object.entries(summaries)) {
+          entries[`summary/${id}`] = summary
+        }
+        if (Object.keys(entries).length > 0) {
+          await this.state.storage.put(entries)
+        }
+        return summaries
+      } catch {
+        // Best-effort pre-warm: swallow failures so on-demand clicks still work cleanly.
+        return {}
+      }
+    })().finally(() => {
+      if (this.activePrewarm?.promise === promise) {
+        this.activePrewarm = undefined
+      }
+    })
+
+    this.activePrewarm = { promise, chapterIds }
+    await promise
   }
 }
 
