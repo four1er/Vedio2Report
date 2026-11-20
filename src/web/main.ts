@@ -2,10 +2,11 @@ import './style.css'
 import { SUMMARY_KEYS, type ArticleMeta, type ChapterMeta, type ParsedRequirements, type Summary5W1H } from '../shared/types'
 import { applyIcons } from './icons'
 import { createArticleRenderer } from './reader'
-import { sampleChapters, sampleMarkdown, sampleSummaries, sampleVideoId, sampleVideoTitle } from './sample'
 import { parseSseEvents, readResponseError } from './stream'
 
 applyIcons()
+
+const DEMO_VIDEO_ID = 'xRh2sVcNXQ8'
 
 function byId<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id)
@@ -25,9 +26,7 @@ const copyLabel = byId('copy-label')
 const feedback = byId('feedback')
 const urlHint = byId('url-hint')
 const fillBtn = byId<HTMLButtonElement>('fill')
-const sampleBtn = byId<HTMLButtonElement>('sample')
 const navStudio = byId<HTMLAnchorElement>('nav-studio')
-const navSample = byId<HTMLAnchorElement>('nav-sample')
 
 const articleSection = byId('article')
 const readerMode = byId('reader-mode')
@@ -48,11 +47,6 @@ let paintFrame = 0
 function showFeedback(message: string) {
   feedback.hidden = !message
   feedback.textContent = message
-}
-
-function setActiveNav(isSample: boolean) {
-  navSample.classList.toggle('selected', isSample)
-  navStudio.classList.toggle('selected', !isSample)
 }
 
 function setBusy(busy: boolean) {
@@ -134,7 +128,7 @@ function renderConstraints(parsed: ParsedRequirements) {
   readerConstraints.hidden = false
 }
 
-function resetReader(isSample: boolean) {
+function resetReader() {
   articleLifetime.abort()
   articleLifetime = new AbortController()
   cancelAnimationFrame(paintFrame)
@@ -152,10 +146,9 @@ function resetReader(isSample: boolean) {
   copyBtn.hidden = true
   exportHtmlBtn.hidden = true
   copyLabel.textContent = '复制 Markdown'
-  readerMode.textContent = isSample ? '参考样稿 · 排版与 5W1H 示例' : 'Gemini 实时流式成稿'
-  readerTitle.textContent = isSample ? '参考样稿' : '正在获取视频字幕…'
+  readerMode.textContent = 'Gemini 实时流式成稿'
+  readerTitle.textContent = '正在获取视频字幕…'
   readerStatus.textContent = ''
-  setActiveNav(isSample)
   articleSection.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
@@ -225,51 +218,12 @@ async function fetchChapterSummary(articleId: string, chapterId: string, signal:
   return data as Summary5W1H
 }
 
-function openSample() {
-  if (activeStream) {
-    showFeedback('文章正在流式生成中，如需查看参考样稿请先点击「停止生成」。')
-    feedback.scrollIntoView({ block: 'center' })
-    return
-  }
-  showFeedback('')
-  resetReader(true)
-  currentMarkdown = sampleMarkdown
-
-  const badge = document.createElement('span')
-  badge.className = 'source-badge'
-  badge.textContent = '参考排版样稿'
-  const link = document.createElement('a')
-  link.href = `https://www.youtube.com/watch?v=${sampleVideoId}`
-  link.target = '_blank'
-  link.rel = 'noopener noreferrer'
-  link.textContent = sampleVideoTitle
-  readerSource.append(badge, ' · ', link, ' · 点击章节旁 [5W1H] 按钮查看示例总结')
-
-  const render = createArticleRenderer(
-    bodyContainer,
-    readerTitle,
-    readerToc,
-    tocList,
-    async chapterId => sampleSummaries[chapterId],
-    articleLifetime.signal,
-  )
-  render(sampleMarkdown, sampleChapters)
-  copyBtn.hidden = false
-  exportHtmlBtn.hidden = false
-}
-
-sampleBtn.addEventListener('click', openSample)
-navSample.addEventListener('click', ev => {
-  ev.preventDefault()
-  openSample()
-})
 navStudio.addEventListener('click', () => {
-  setActiveNav(false)
   videoInput.focus({ preventScroll: true })
 })
 
 fillBtn.addEventListener('click', () => {
-  videoInput.value = `https://www.youtube.com/watch?v=${sampleVideoId}`
+  videoInput.value = `https://www.youtube.com/watch?v=${DEMO_VIDEO_ID}`
   videoInput.setCustomValidity('')
   urlHint.textContent = '已填入《马克·安德森 2026 AI 展望》访谈链接，点击「开始流式生成」即可体验。'
   showFeedback('')
@@ -331,7 +285,7 @@ form.addEventListener('submit', async ev => {
 
   showFeedback('')
   setBusy(true)
-  resetReader(false)
+  resetReader()
   readerStatus.textContent = '正在获取并校验 YouTube 字幕…'
 
   const startedAt = performance.now()
